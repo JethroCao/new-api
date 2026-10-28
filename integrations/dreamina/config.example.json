@@ -11,6 +11,6 @@
   "publicUrl": "http://localhost:8787",
   "models": {
     "dreamina-image": { "kind": "image", "model": "seedream_4.0", "ratio": "1:1", "resolution": "2K", "counts": [1, 2, 3, 4], "maxCredits": 0 },
-    "dreamina-video": { "kind": "video", "model": "seedance_2.0_mini", "ratio": "16:9", "resolution": "720p", "durations": [5, 10], "maxCredits": 0 }
+    "dreamina-video": { "kind": "video", "model": "seedance_2.5", "ratio": "16:9", "resolution": "480p", "durations": [5, 10], "maxCredits": 0 }
   }
 }
