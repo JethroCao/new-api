@@ -28,9 +28,9 @@ const request = { kind: 'image', model: 'dreamina-image', prompt: 'a paper boat'
 
 test('reject invalid/unbounded requests before any CLI mutation', async t => {
   const { bridge } = await fixture(t, async () => { throw new Error('CLI must not be called'); });
-  for (const change of [{ n: 0 }, { n: 100 }, { n: 1.1 }, { n: '1' }, { prompt: '' }, { prompt: 'x'.repeat(10001) },
-    { n: null }, { model: 'unknown' }, { kind: 'video' }, { image: 'https://example.com/a.png' }, { maxCredits: 999 }]) {
-    await assert.rejects(bridge.submit({ ...request, ...change }, 'key-' + JSON.stringify(change)), /invalid|unsupported/);
+  for (const [index, change] of [{ n: 0 }, { n: 100 }, { n: 1.1 }, { n: '1' }, { prompt: '' }, { prompt: 'x'.repeat(10001) },
+    { n: null }, { prompt: '{{res :private}}' }, { model: 'unknown' }, { kind: 'video' }, { image: 'https://example.com/a.png' }, { maxCredits: 999 }].entries()) {
+    await assert.rejects(bridge.submit({ ...request, ...change }, 'invalid-' + index), /invalid|unsupported/);
   }
   await assert.rejects(bridge.submit(request, ''), /idempotency/i);
 });
@@ -415,4 +415,18 @@ test('reference admission aborts during DNS without holding the queue indefinite
   controller.abort(new Error('Reference deadline exceeded'));
   release([{address:'8.8.8.8',family:4}]);
   await assert.rejects(pending,/deadline/);
+});
+
+test('an upload-rejected queued job cannot starve a healthy leased request',async t=>{
+  let uploads=0,paid=0;
+  const {bridge}=await videoFixture(t,async a=>{
+    if(a[0]==='resource'){uploads++;throw new Error('upload rejected');}
+    if(a[0]==='node'){paid++;return {submission:{state:'accepted'}};}
+    return {state:'running',resources:[]};
+  });
+  const blocked=await bridge.submit({kind:'video',model:'seedance_2.5',references:[{type:'image',url:'data:image/png;base64,'+png.toString('base64')}]},'upload-blocked');
+  const healthy=await bridge.submit({kind:'video',model:'seedance_2.5',prompt:'healthy'},'healthy');
+  await bridge.tick();await bridge.tick();await bridge.tick();
+  assert.equal(bridge.get(healthy.id).status,'in_progress');
+  assert.equal(bridge.get(blocked.id).status,'queued');assert.equal(paid,1);assert.ok(uploads>=1);
 });

@@ -76,3 +76,9 @@ test('query errors remain unknown and old image tasks cannot be created', () => 
   assert.equal(p.parseTaskResult({}, {status:'surprise'}, {status:200}).status,'UNKNOWN');
   assert.throws(()=>decode({model:'dreamina-image',prompt:'x'}));
 });
+
+test('prompt placeholders cannot inject private canvas references using whitespace or alternate spelling',()=>{
+  for(const prompt of ['{{res :11111111-1111-4111-8111-111111111111}}','{{ node : node_0123456789}}','{{uri : private}}','{{vid : private}}','{{RES:private}}','{{\tres\n:private}}']) {
+    assert.throws(()=>decode({prompt,mode:'m2v',references:[{type:'image',url:'https://example.com/public.png'}]}),/prompt/);
+  }
+});

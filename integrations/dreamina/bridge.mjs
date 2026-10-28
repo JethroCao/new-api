@@ -124,6 +124,7 @@ export class Bridge {
     this.cli = cli || (args => runCLI(config.cli, ['--format=json', '--non-interactive', '--profile=' + config.profile, '--region=' + config.region, ...args], config.commandTimeoutMs));
     this.contextKey = hash(JSON.stringify([config.profile, config.region, config.userId, config.space, config.projectId, config.models]));
     this.jobs = new Map(); this.keys = new Map(); this.admissions = Promise.resolve();
+    this.lastQueuedId = null;
     this.promptLimits = new Map();
     this.videoCatalog = new Map();
     this.leases = new Map(); // Deliberately not restored after downtime.
@@ -215,7 +216,7 @@ export class Bridge {
     if (!m || m.kind !== body.kind) fail('unsupported model/kind');
     const allowed = ['model', 'kind', 'prompt', ...(m.kind === 'image' ? ['n'] : ['seconds'])];
     if (Object.keys(body).some(k => !allowed.includes(k))) fail('unsupported request field');
-    if (typeof body.prompt !== 'string' || !body.prompt.trim() || body.prompt.length > (this.promptLimits.get(body.model) || 2000) || body.prompt.includes('\0')) fail('invalid prompt');
+    if (typeof body.prompt !== 'string' || !body.prompt.trim() || body.prompt.length > (this.promptLimits.get(body.model) || 2000) || /\0|\{\{/.test(body.prompt)) fail('invalid prompt');
     const count = m.kind === 'image' ? (body.n === undefined ? 1 : body.n) : 1;
     const seconds = m.kind === 'video' ? (body.seconds === undefined ? 5 : body.seconds) : undefined;
     if (m.kind === 'image' && !m.counts.includes(count)) fail('invalid image count');
@@ -311,8 +312,18 @@ export class Bridge {
     }
     for (const active of this.jobs.values()) if (active.status === 'in_progress') await this.processJob(active);
     if ([...this.jobs.values()].filter(j => j.status === 'in_progress').length >= this.config.maxConcurrent) return;
-    const job = [...this.jobs.values()].find(j => j.status === 'queued' && this.leases.get(j.id) > Date.now());
-    if (job) await this.processJob(job);
+    // Round-robin preparation, at most one attempt per polling interval. An
+    // unavailable reference/model must not monopolize every free slot while
+    // the same user's polling keeps its lease alive.
+    const queued = [...this.jobs.values()].filter(j => j.status === 'queued');
+    const previous = queued.findIndex(j => j.id === this.lastQueuedId);
+    for (let offset = 1; offset <= queued.length; offset++) {
+      const job = queued[(previous + offset) % queued.length];
+      if (!(this.leases.get(job.id) > Date.now())) continue;
+      this.lastQueuedId = job.id;
+      await this.processJob(job);
+      break;
+    }
   }
 
   async processJob(job) {

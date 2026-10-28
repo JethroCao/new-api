@@ -74,7 +74,10 @@ export function normalizeVideo(req, model, allowFileRefs) {
     if (spec.requireVisual && !references.some(r => r.type !== 'audio')) throw new Error('This model requires an image or video reference');
   }
   const prompt = req.prompt === undefined ? '' : req.prompt;
-  if (typeof prompt !== 'string' || (mode === 't2v' && !prompt.trim()) || prompt.length > spec.promptLimit || /\0|\{\{\s*(node|res|uri|vid):/.test(prompt)) throw new Error('Invalid prompt; direct canvas resource references are not allowed');
+  // The CLI normalizes whitespace in resource placeholders. Reserve the
+  // entire opening delimiter, including escaped/unknown spellings, so prompt
+  // parsing can never add resources outside the validated references array.
+  if (typeof prompt !== 'string' || (mode === 't2v' && !prompt.trim()) || prompt.length > spec.promptLimit || /\0|\{\{/.test(prompt)) throw new Error('Invalid prompt; canvas placeholder delimiters are not allowed');
   let resolution = req.resolution, ratio = req.ratio;
   if (req.size !== undefined) {
     const sizes = { '854x480':['480p','16:9'], '480x854':['480p','9:16'], '1280x720':['720p','16:9'], '720x1280':['720p','9:16'], '1920x1080':['1080p','16:9'], '1080x1920':['1080p','9:16'], '3840x2160':['4k','16:9'], '2160x3840':['4k','9:16'] };
