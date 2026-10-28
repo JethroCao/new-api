@@ -10,14 +10,15 @@
 - 文生视频：`POST /v1/videos`，模型 `dreamina-video`，JSON 请求；`GET /v1/videos/:id` 查询，`GET/HEAD /v1/videos/:id/content` 下载。
 - 不接受图片编辑、参考图/文件、音频、画布编辑、Responses API。未知参数会报错，尺寸和比例由服务端配置固定。
 - 图片/视频共用一个串行队列。提交身份在调用 CLI 前落盘，断线或重启只查询原 submit ID，不自动重提。
-- **CLI 视频生成和导出已实测。** 虽然 CLI 1.1.1 的下载摘要只描述图片，实际 `resource download` 可以下载本次生成的视频 MP4。适配服务仍校验文件签名、大小和 SHA256；下载失败时保持 `in_progress` 且 `attention=download_failed`，不会谎报完成或重新生成。
+- **视频完整 API 链路已实测。** 虽然 CLI 1.1.1 的下载摘要只描述图片，实际 `resource download` 可以下载本次生成的视频 MP4。适配服务仍校验文件签名、大小和 SHA256；下载失败时保持 `in_progress` 且 `attention=download_failed`，不会谎报完成或重新生成。
 
 自动化测试覆盖模拟 CLI 的成功、失败、超时恢复与 HTTP 交付。2026-10-28 使用 CLI 1.1.1 完成以下实测：
 
 - 个人空间图片：New API → 插件 → HTTP 服务 → Seedream 4.0（2K、1 张，上限 1 积分）→ PNG 下载及校验 → OpenAI 图片响应。
 - 团队空间视频：CLI 保存、报价、批准并生成 Seedance 2.5（480p、5 秒、上限 60 积分），下载得到 854×480、容器时长 5.057 秒的 MP4，SHA256 校验通过。将这一个已受理任务用于适配服务恢复测试，查询完成并通过插件内容请求下载原文件（HTTP 200）及分段内容（HTTP 206），没有重复生成。
+- 视频新任务完整链路：通过 New API `POST /v1/videos` 创建另一条 480p、5 秒任务（HTTP 200），通过 `GET /v1/videos/:id` 观察 `queued → in_progress → completed`。内容接口 GET/HEAD 返回 200，Range 返回 206，无令牌返回 401；下载文件与桥接原文件的 SHA256 一致，实际 854×480、5.057 秒。New API 测试费用临时设为 0，日志用量为 `seconds: 5.00`；测试后恢复价格、删除令牌并禁用测试渠道。即梦侧每次生成均限制最高 60 团队积分。
 
-视频的新任务尚未从 New API `/v1/videos` 入口完整提交实测；上述视频验证覆盖真实 CLI 生成及适配服务恢复/下载。个人空间保存 Seedance 2.0 mini 节点曾返回 `access_denied`，账号/团队权限仍以实际准入为准。CLI dry-run 只验证本地参数；报价上限也不是最终净扣费账单。
+完整联调曾发现下载接口返回 502 `artifact_request_rejected`：网关文件获取策略拒绝本地桥接地址和端口。按下文配置精确白名单后，同一个已有任务的下载验证通过，没有重新生成。个人空间保存 Seedance 2.0 mini 节点曾返回 `access_denied`，账号/团队权限仍以实际准入为准。CLI dry-run 只验证本地参数；报价上限也不是最终净扣费账单。
 
 ## 准备 CLI 与配置
 
@@ -59,6 +60,7 @@ npm start
 2. 新建 **任务插件（类型 61）** 渠道，绑定该插件；Base URL 填适配服务地址，Key 填 `DREAMINA_BRIDGE_TOKEN`（原值，程序添加 Bearer）。
 3. 先启用 `dreamina-image`；视频完成真实生成与下载验收后再启用 `dreamina-video`。这里的别名由适配服务映射到 CLI 模型，不要将渠道模型映射到 `seedream_*`/`seedance_*`。
 4. 配置分组、令牌权限及计费。插件提供图片 `image_count` 和视频 `seconds` 用量；没有内置美元价格。图片完成时按实际交付数量，视频按实际发送给 CLI 的时长参数结算。即梦积分与 New API 用户账单是两套体系。
+5. 配置媒体下载地址的安全策略，见下节。创建/查询成功不代表下载地址也被允许。
 
 ```sh
 # NEW_API_KEY 是 New API 用户令牌，与服务之间的桥接密钥不同。
@@ -72,6 +74,19 @@ curl http://localhost:3000/v1/videos \
 ```
 
 视频返回 New API 的公开任务 ID，后续用同一用户令牌查询和下载。图片默认等待最多 600 秒（由 New API 的 `TASK_PLUGIN_PROTOCOL_TIMEOUT_SECONDS` 控制）；客户端超时不表示上游停止，不要盲目发起另一笔生成。
+
+### 本地媒体下载白名单
+
+New API 视频内容代理另行应用全局 `fetch_setting`，不会因为插件渠道 Base URL 已配置就自动放行。默认策略禁止私有/特殊 IP，且默认允许端口不包括 8787；本地 Docker 部署可能因此在下载时返回 502 `artifact_request_rejected`。
+
+对专用本地测试实例，可在系统安全设置中保持 `enable_ssrf_protection=true`，使用以下限制组合：
+
+- `domain_filter_mode=true`，`domain_list` 仅列受信的桥接域名（本次为 `host.docker.internal`）。
+- `ip_filter_mode=true`，`ip_list` 仅列容器内核验过的桥接 IP，使用 `/32` 或 `/128` 精确地址；不要照搬另一台机器的解析结果。
+- `allowed_ports` 仅列桥接端口（本次为 `8787`），`apply_ip_filter_for_domain=true`。
+- 仅在上述域名/IP/端口限制就绪后设置 `allow_private_ip=true`，从而允许指定的本地目标，而不是放开整个内网。不要关闭 SSRF 保护。
+
+这些设置作用于整个实例的文件获取，单目标白名单会限制其他外链抓取。已有业务的实例需同时规划其他受信目标，或将桥接服务部署到可由网关访问的公网 HTTPS 地址，并使其满足现有获取策略。本次测试结束已恢复原安全设置；再次启用本地渠道时仍需配置相应白名单。
 
 ## 状态、恢复和存储
 
@@ -96,4 +111,4 @@ npm test
 go test ./plugins
 ```
 
-自动化测试不消耗即梦积分。面向用户开放前，应在目标部署上完成视频新任务的端到端验收；本接入仍是开发版本。
+自动化测试不消耗即梦积分。图片和视频完整链路已在本地部署验证；更换部署时仍应核验账号、空间、报价上限、下载安全策略和业务计费。本接入仍是开发版本。
