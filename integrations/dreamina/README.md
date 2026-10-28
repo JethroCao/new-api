@@ -1,114 +1,187 @@
-# 即梦 CLI 接入 New API（实验版）
+# 即梦视频 CLI 接入 New API
 
-`客户端 → New API 类型 61 任务插件 → 本机 HTTP 服务 → dreamina-canvas → 即梦`
+`客户端 → New API 类型 61 任务插件 → HTTP 适配服务 → dreamina-canvas → 即梦`
 
-本目录是独立适配服务，无 npm 依赖；不修改 New API 数据库或内置即梦渠道。内置即梦渠道使用火山引擎 AK/SK，不能绑定这里的 CLI 服务。
+版本 0.2.0 提供视频生成、参考素材上传、样片转正片、异步查询和多结果下载。New API 继续负责用户鉴权、渠道路由、额度预扣/结算/退款、任务归属及下载鉴权；本目录只实现插件和独立 Node.js 适配服务，无 npm 依赖，不修改网关核心和数据库。终端用户使用 New API 令牌请求 API，无需打开即梦网页或操作 CLI；服务管理员负责 CLI 登录、空间、画布和导出设置。
 
-## 当前范围
+图片生成接口已从插件移除。图片仍可作为视频参考素材。内置即梦 AK/SK 渠道与本插件不同，必须使用类型 61 任务插件渠道。
 
-- 文生图：`POST /v1/images/generations`，模型 `dreamina-image`，同步等待结果；支持 `n`、`response_format=url|b64_json`。
-- 文生视频：`POST /v1/videos`，模型 `dreamina-video`，JSON 请求；`GET /v1/videos/:id` 查询，`GET/HEAD /v1/videos/:id/content` 下载。
-- 不接受图片编辑、参考图/文件、音频、画布编辑、Responses API。未知参数会报错，尺寸和比例由服务端配置固定。
-- 图片/视频共用一个串行队列。提交身份在调用 CLI 前落盘，断线或重启只查询原 submit ID，不自动重提。
-- **视频完整 API 链路已实测。** 虽然 CLI 1.1.1 的下载摘要只描述图片，实际 `resource download` 可以下载本次生成的视频 MP4。适配服务仍校验文件签名、大小和 SHA256；下载失败时保持 `in_progress` 且 `attention=download_failed`，不会谎报完成或重新生成。
+## 模型与参数
 
-自动化测试覆盖模拟 CLI 的成功、失败、超时恢复与 HTTP 交付。2026-10-28 使用 CLI 1.1.1 完成以下实测：
+下表来自 2026-10-28 官方 Canvas CLI 1.1.1 的实时模型目录。插件做静态参数校验，适配服务启动和提交前再核对实时目录；账号权限、可用性和报价最终由即梦服务端决定。
 
-- 个人空间图片：New API → 插件 → HTTP 服务 → Seedream 4.0（2K、1 张，上限 1 积分）→ PNG 下载及校验 → OpenAI 图片响应。
-- 团队空间视频：CLI 保存、报价、批准并生成 Seedance 2.5（480p、5 秒、上限 60 积分），下载得到 854×480、容器时长 5.057 秒的 MP4，SHA256 校验通过。将这一个已受理任务用于适配服务恢复测试，查询完成并通过插件内容请求下载原文件（HTTP 200）及分段内容（HTTP 206），没有重复生成。
-- 视频新任务完整链路：通过 New API `POST /v1/videos` 创建另一条 480p、5 秒任务（HTTP 200），通过 `GET /v1/videos/:id` 观察 `queued → in_progress → completed`。内容接口 GET/HEAD 返回 200，Range 返回 206，无令牌返回 401；下载文件与桥接原文件的 SHA256 一致，实际 854×480、5.057 秒。New API 测试费用临时设为 0，日志用量为 `seconds: 5.00`；测试后恢复价格、删除令牌并禁用测试渠道。即梦侧每次生成均限制最高 60 团队积分。
+| API 模型名 | 分辨率 | 时长（整数秒） | 首尾帧 | 多模态参考上限 |
+| --- | --- | --- | --- | --- |
+| `seedance_2.5` | 480p / 720p / 1080p | 4–30 | 1 或 2 图 | 总计 50：图 30 / 视频 10 / 音频 10 |
+| `seedance_2.5_draft` | 480p | 4–30 | 1 或 2 图 | 总计 50：图 30 / 视频 10 / 音频 10 |
+| `seedance_2.0_vip` | 720p / 1080p / 4k | 4–15 | 1 或 2 图 | 总计 12：图 9 / 视频 3 / 音频 3 |
+| `seedance_2.0_fast_vip` | 720p | 4–15 | 1 或 2 图 | 总计 12：图 9 / 视频 3 / 音频 3 |
+| `seedance_2.0_mini` | 720p | 4–15 | 1 或 2 图 | 总计 12：图 9 / 视频 3 / 音频 3 |
+| `seedance_pro_fast` | 720p / 1080p | 5–10 | 仅首帧 1 图 | 不支持 |
+| `happyhorse_1.1` | 720p / 1080p | 4–15 | 仅首帧 1 图 | 图 9 |
+| `wan_3.0` | 720p / 1080p | 4–15 | 1 或 2 图 | 总计 20：图 10 / 视频 5 / 音频 5 |
 
-完整联调曾发现下载接口返回 502 `artifact_request_rejected`：网关文件获取策略拒绝本地桥接地址和端口。按下文配置精确白名单后，同一个已有任务的下载验证通过，没有重新生成。个人空间保存 Seedance 2.0 mini 节点曾返回 `access_denied`，账号/团队权限仍以实际准入为准。CLI dry-run 只验证本地参数；报价上限也不是最终净扣费账单。
+- 全部模型支持文生视频，`n` 为 1–4，默认 1；`seconds` 默认 5。`resolution` 默认模型表中第一个值，输入大小写不敏感，发送 CLI 时自动匹配其大小写。
+- `ratio` 默认 `16:9`。Seedance 系列支持 `21:9,16:9,4:3,1:1,3:4,9:16`；HappyHorse 另支持 `4:5,5:4,9:21`；Wan 支持 `16:9,4:3,1:1,3:4,9:16`。
+- `mode` 为 `t2v`、`first_last_frame`、`m2v`。不传时：无参考素材为 `t2v`，单张图片为 `first_last_frame`，其余为 `m2v`。两张图片做首尾帧时须显式指定 `first_last_frame`，按首帧、尾帧顺序上传。
+- Seedance 2.0 和 Wan 的多模态输入必须包含图片或视频；Seedance 2.5 可以只提供音频。首尾帧模式只允许图片。
+- 提示词上限分别为 HappyHorse 2500、Seedance 2.0 系列 4000、Seedance 2.5 系列 15000、Pro Fast 2000、Wan 20000 个 UTF-16 单元。文生视频不能为空；参考模式可以省略提示词。
+- 兼容 `size` 的横竖屏组合：`854x480` / `480x854`、`1280x720` / `720x1280`、`1920x1080` / `1080x1920`、`3840x2160` / `2160x3840`，映射到分辨率和比例，仍须符合模型能力。与显式参数冲突时报错。其他比例使用 `resolution` + `ratio`。
+- `dreamina-video` 是 `seedance_2.5` 的兼容别名，推荐客户端直接用规范模型名。未知参数、不支持的组合、任意本地路径、即梦内部资源 ID 和提示词中的画布资源引用均拒绝。
+- 返回 `n` 表示请求数量，`video_count` 表示成功交付数量。批量部分失败时保留成功视频，并按成功数量结算。
+
+## API 使用
+
+以下请求均发往 New API；`NEW_API_KEY` 为终端用户令牌，不是桥接密钥。
+
+```sh
+curl http://localhost:3000/v1/videos \
+  -H "Authorization: Bearer $NEW_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"model":"seedance_2.5","prompt":"海浪轻轻拍打沙滩，固定机位","seconds":10,"resolution":"1080p","ratio":"9:16","n":2}'
+```
+
+获得公开任务 ID 后查询状态，完成后下载第一个视频：
+
+```sh
+curl "http://localhost:3000/v1/videos/$TASK_ID" -H "Authorization: Bearer $NEW_API_KEY"
+curl "http://localhost:3000/v1/videos/$TASK_ID/content" \
+  -H "Authorization: Bearer $NEW_API_KEY" -o video.mp4
+# 多结果：从 New API 的产物列表取得各产物下载地址。
+curl "http://localhost:3000/v1/tasks/$TASK_ID/artifacts" -H "Authorization: Bearer $NEW_API_KEY"
+```
+
+产物键依次为 `video`、`video-2`、`video-3`、`video-4`。下载支持 GET、HEAD 和单段 Range。任务及所有产物仍受 New API 用户归属校验，响应不暴露桥接密钥、CLI 资源 ID 或签名下载链接。
+
+首尾帧 multipart 上传（同一 `references` 字段按顺序重复）：
+
+```sh
+curl http://localhost:3000/v1/videos \
+  -H "Authorization: Bearer $NEW_API_KEY" \
+  -F model=seedance_2.5 -F mode=first_last_frame -F seconds=5 \
+  -F resolution=720p -F ratio=16:9 -F 'prompt=从首帧自然过渡到尾帧' \
+  -F 'references=@first.png;type=image/png' \
+  -F 'references=@last.jpg;type=image/jpeg'
+```
+
+单图也可用文件字段 `input_reference`。多模态模式可在 `references` 字段中按顺序上传图片、视频和音频，必须使用相应 MIME 类型；不要混用文件与 URL 参考。普通参数不能重复。JSON 示例：
+
+```json
+{
+  "model": "seedance_2.5",
+  "mode": "m2v",
+  "prompt": "参考画面风格，跟随音频节奏运动",
+  "seconds": 10,
+  "resolution": "720p",
+  "references": [
+    {"type": "image", "url": "https://your-public-media-host.example/reference.png"},
+    {"type": "audio", "url": "https://your-public-media-host.example/music.mp3"}
+  ]
+}
+```
+
+参考素材也接受 `data:<mime>;base64,...`，但大文件应使用 multipart，避免超过 New API 的任务快照大小限制。每笔请求全部参考素材合计最多 64 MiB，可由服务端进一步调低；URL 下载共用 30 秒期限。支持 PNG/JPEG/WebP、MP4/WebM、WAV/MP3/Ogg/M4A/FLAC，并检查文件头。URL 只允许公网 IPv4 HTTPS 443，逐跳重验 DNS 并固定连接地址；私有 IP、IPv6-only、凭据 URL 和其他端口拒绝。上传成功不保证素材内容或编码满足即梦审核及模型要求。
+
+### 样片转正片
+
+先用 `seedance_2.5_draft`、`n:1` 创建并完成样片，再提交以下请求：
+
+```json
+{
+  "model": "seedance_2.5",
+  "mode": "promote",
+  "draft_task_id": "task_你的已完成样片任务ID",
+  "resolution": "1080p"
+}
+```
+
+New API 校验来源任务归属并固定到来源渠道，桥接服务再次核对本地样片记录。转正继承样片的时长和比例，不能另传提示词、参考素材或批量参数；目前官方转正规格仅支持 1080p。只允许单结果样片，因为 CLI 尚未提供从同一节点多个样片结果中选择一个的参数。转正是新任务，单独报价及计费。
+
+**样片最多保留 7 天，过期后不能转正**，具体期限和来源可用性以即梦服务端为准。下载保存在本地不延长即梦侧转正期限。
 
 ## 准备 CLI 与配置
 
-要求 Node.js 22+，以及当前用户已安装的官方 `dreamina-canvas`。适配服务运行在 CLI 所在主机，用官方 CLI 自己的登录存储；不复制 Cookie、OAuth token 或团队授权。
+要求 Node.js 22+ 和官方 `dreamina-canvas`。桥接服务在 CLI 所在主机运行，使用 CLI 自己的授权存储，不复制 Cookie 或 OAuth token。
 
-为服务准备一个独占的 profile（例 `new-api`），按照 CLI 的 `auth login --help` 完成授权。确认空间并选择/创建用于服务的画布：
+为服务准备独占 profile（示例 `new-api`），按照 `auth login --help` 完成授权，然后检查账号、空间和画布：
 
 ```sh
 dreamina-canvas --profile new-api --format json auth status
 dreamina-canvas --profile new-api --format json space current
 dreamina-canvas --profile new-api --format json canvas ls --limit 20
-dreamina-canvas --profile new-api --format json model list --type image
 dreamina-canvas --profile new-api --format json model list --type video
 ```
 
-需要更换个人/团队空间时，按 `space use --help` 显式选择。服务不会自动切换空间、创建画布、登录或批准增加预算。不要让其他进程/人工同时修改这个 profile 的登录和空间；一个 profile 只能对应一个桥接服务实例。
+按 `space use --help` 选择个人/团队空间。一个 profile 只对应一个桥接实例，其他进程不要切换其登录或空间。服务不会自动登录、切换空间、创建画布或提高消费上限。
 
-复制 `config.example.json` 为 `config.local.json`，填入绝对路径、账号 ID、画布 UUID 和预期空间。团队空间写 `team:<teamId>`。所有示例模型须通过启动时的实时规格检查，服务检查 ratio/resolution/count/duration 的有效值及大小写。
+复制 `config.example.json` 为 `config.local.json`，填写 CLI 和数据目录绝对路径、账号 ID、画布 UUID，以及 `personal` 或 `team:<teamId>`。`models` 只保留需要开放的规范模型名，每个模型可分别设置 `maxCredits`。
 
-`maxCredits` 是**每次生成的最高即梦积分报价**，不是人民币或 New API 单价。示例为 0，不批准正积分消费。管理员应在确认个人/团队消费主体后明确设置允许上限。客户端无法覆盖。图片批量的上限覆盖整次任务，而非每张图。没有按天/总额自动配额；面向用户时还应配置 New API 的令牌额度、限流和模型价格。
+`maxCredits` 是**整次任务（含全部 n 个结果）的最高即梦积分报价**，不是每个视频的积分，也不是人民币或 New API 单价。示例全部为 0，不批准正积分消费；管理员须明确设置允许的上限，客户端不能覆盖。它不等于累计预算，仍须设置 New API 令牌额度、限流和价格。
 
 ```sh
 cd integrations/dreamina
 cp config.example.json config.local.json
-# 编辑 config.local.json 后执行；密钥应随机生成并保存，重启保持不变。
+# 编辑配置；密钥应随机生成、妥善保存，重启保持不变。
 export DREAMINA_BRIDGE_TOKEN="$(openssl rand -hex 32)"
 export DREAMINA_BRIDGE_CONFIG="$PWD/config.local.json"
 npm run check
 npm start
 ```
 
-`check` 只核验当前账号/空间和模型参数，不创建任务，也不验证指定画布的编辑权限。首次真实请求前需确认该画布可编辑、模型权限和积分充足。
+`check` 只核对账号、空间和实时模型目录，不生成、不验证画布编辑权限。正式开放前需确认画布权限、报价上限及实际计费。
 
-`host` 默认 `127.0.0.1`，端口 8787。若 New API 在 Docker 内运行，渠道地址一般为 `http://host.docker.internal:8787`；先确认容器能连通。某些网络环境需要将 `host` 设为 `0.0.0.0` 并限制防火墙访问。`publicUrl` 是图片结果中的签名链接地址，必须同时能被客户端和 New API 访问，不能随意填写容器内的 localhost。跨主机访问时使用 TLS 反向代理。
+默认监听 `127.0.0.1:8787`。Docker 中 New API 的渠道地址通常为 `http://host.docker.internal:8787`；确认容器能连通，必要时绑定 `0.0.0.0` 并限制防火墙。跨主机使用 TLS 反向代理。`publicUrl` 为兼容历史图片下载保留，仍需填写有效服务地址，当前视频由 New API 鉴权代理下载。
 
-## 在 New API 配置
+## New API 渠道与计费
 
-1. 在任务插件管理中上传本目录 `plugin.js`，启用 `dreamina-cli`。
-2. 新建 **任务插件（类型 61）** 渠道，绑定该插件；Base URL 填适配服务地址，Key 填 `DREAMINA_BRIDGE_TOKEN`（原值，程序添加 Bearer）。
-3. 先启用 `dreamina-image`；视频完成真实生成与下载验收后再启用 `dreamina-video`。这里的别名由适配服务映射到 CLI 模型，不要将渠道模型映射到 `seedream_*`/`seedance_*`。
-4. 配置分组、令牌权限及计费。插件提供图片 `image_count` 和视频 `seconds` 用量；没有内置美元价格。图片完成时按实际交付数量，视频按实际发送给 CLI 的时长参数结算。即梦积分与 New API 用户账单是两套体系。
-5. 配置媒体下载地址的安全策略，见下节。创建/查询成功不代表下载地址也被允许。
+1. 上传 `plugin.js` 并启用 `dreamina-cli`。
+2. 新建**任务插件（类型 61）**渠道，绑定插件，Base URL 填桥接地址，Key 填 `DREAMINA_BRIDGE_TOKEN` 原值。
+3. 渠道模型选择需要开放的规范模型名，必须与桥接 `models` 配置一致。不要映射到其他供应商模型；兼容别名 `dreamina-video` 会发往桥接的 `seedance_2.5`。
+4. 配置分组、用户令牌权限、限流及每个模型的任务计费表达式；插件不内置美元价格。
+5. 配置媒体下载安全策略，验证生成、查询和下载整个链路后再开放渠道。
 
-```sh
-# NEW_API_KEY 是 New API 用户令牌，与服务之间的桥接密钥不同。
-curl http://localhost:3000/v1/images/generations \
-  -H "Authorization: Bearer $NEW_API_KEY" -H 'Content-Type: application/json' \
-  -d '{"model":"dreamina-image","prompt":"一只纸船漂在平静湖面上","n":1,"response_format":"url"}'
-
-curl http://localhost:3000/v1/videos \
-  -H "Authorization: Bearer $NEW_API_KEY" -H 'Content-Type: application/json' \
-  -d '{"model":"dreamina-video","prompt":"海浪轻轻拍打沙滩，固定机位","seconds":5}'
-```
-
-视频返回 New API 的公开任务 ID，后续用同一用户令牌查询和下载。图片默认等待最多 600 秒（由 New API 的 `TASK_PLUGIN_PROTOCOL_TIMEOUT_SECONDS` 控制）；客户端超时不表示上游停止，不要盲目发起另一笔生成。
+计费用量 `seconds` 在预扣时为 `seconds × n`，完成时改为 `seconds × 成功交付数量`；`resolution`（统一小写）、`mode`、`reference_video` 为创建时冻结的条件，管理员可据此配置不同费率。失败及差额结算复用 New API。沿用按次固定价格不会自动得到按时长计费，需配置任务计费表达式。即梦积分和用户账单是两套独立体系，插件不会将即梦积分虚构为美元单价。
 
 ### 本地媒体下载白名单
 
-New API 视频内容代理另行应用全局 `fetch_setting`，不会因为插件渠道 Base URL 已配置就自动放行。默认策略禁止私有/特殊 IP，且默认允许端口不包括 8787；本地 Docker 部署可能因此在下载时返回 502 `artifact_request_rejected`。
+New API 内容代理另行应用全局 `fetch_setting`，渠道 Base URL 不会自动放行。默认私有 IP 和 8787 端口限制可能导致 502 `artifact_request_rejected`。
 
-对专用本地测试实例，可在系统安全设置中保持 `enable_ssrf_protection=true`，使用以下限制组合：
+专用本地实例可保持 `enable_ssrf_protection=true`，设置以下精确白名单：
 
-- `domain_filter_mode=true`，`domain_list` 仅列受信的桥接域名（本次为 `host.docker.internal`）。
-- `ip_filter_mode=true`，`ip_list` 仅列容器内核验过的桥接 IP，使用 `/32` 或 `/128` 精确地址；不要照搬另一台机器的解析结果。
-- `allowed_ports` 仅列桥接端口（本次为 `8787`），`apply_ip_filter_for_domain=true`。
-- 仅在上述域名/IP/端口限制就绪后设置 `allow_private_ip=true`，从而允许指定的本地目标，而不是放开整个内网。不要关闭 SSRF 保护。
+- `domain_filter_mode=true`，`domain_list` 仅列受信桥接域名，例如 `host.docker.internal`。
+- `ip_filter_mode=true`，`ip_list` 填容器内实际核验的桥接 `/32` 或 `/128` 地址。
+- `allowed_ports` 仅列桥接端口，`apply_ip_filter_for_domain=true`。
+- 上述限制就绪后才设置 `allow_private_ip=true`，不要关闭 SSRF 保护。
 
-这些设置作用于整个实例的文件获取，单目标白名单会限制其他外链抓取。已有业务的实例需同时规划其他受信目标，或将桥接服务部署到可由网关访问的公网 HTTPS 地址，并使其满足现有获取策略。本次测试结束已恢复原安全设置；再次启用本地渠道时仍需配置相应白名单。
+这是实例级设置，须兼顾已有业务的其他受信抓取目标；也可部署满足现有策略的公网 HTTPS 桥接地址。历史联调后的安全设置已恢复，本次开发没有自动放开白名单。
 
-## 状态、恢复和存储
+## 队列、恢复与存储
 
-- 桥接 API 仅供可信 New API 渠道访问。`POST /v1/jobs` 要求 Bearer 和 `Idempotency-Key`；插件自动用 New API 的 `publicTaskId`。相同键/请求返回同一任务，不同请求返回 409。不同客户端请求即使 prompt 相同，仍是不同生成。
-- `GET /v1/jobs/:id` 返回状态；鉴权的 `GET /healthz` 只表示服务存活，不等于即梦登录、生成或下载可用。
-- 每次执行前检查账号与空间。`context_mismatch`、`cli_unavailable` 时停止生成，修复原 profile 后自动继续。队首 `attention` 会阻止后续生成，这是保护消费身份的保守策略。
-- 未开始的任务默认最多排队 300 秒（`maxQueueWaitSeconds`），过期以 `queue_expired` 失败，不执行生成。排队任务还需要最近的网关轮询租约（`leaseSeconds` 默认 15 秒）；重启不恢复租约，必须由网关继续查询后才允许开始。直接使用桥接 API 的客户端也必须持续查询任务。
-- New API 的任务超时必须大于排队上限加 CLI 命令超时，连续轮询失败窗口也必须大于租约（默认 New API 配置满足）。若调小 `TASK_TIMEOUT_MINUTES` 或 `TASK_POLL_MAX_FAILURES`，同步减小桥接排队/租约时间。租约避免长期离线后启动弃单，不是跨服务原子取消：生成提交与网关终止恰好并发时仍可能消费，已提交任务不会自动取消。
-- `submission_uncertain`/`status_unavailable`/`manual_recovery_required`：使用存储文件中的 submitId 和 projectId 执行只读 `operation status`，必要时按官方 Skill 恢复。`absent` 不证明从未扣费；不要删除任务或换 ID 重跑。
-- `download_failed`：远端可能已经收费，保持任务进行中，修复 CLI 导出/磁盘后自动重试下载。不能据此自动给任务退款或再生成一次。
-- 退出码 10（报价未批准）以及明确 rejected/failed 状态会终止任务。登录、网络和其他未知失败保留原任务等待排查。
-- 正常 SIGINT/SIGTERM 会等当前 CLI 命令结束并释放锁。异常退出留下 `dataDir/.lock`，先核对文件中的 PID 已退出再删除锁并重启；启动会加载原任务继续只读恢复。
-- 固定配置与存储绑定。修改账号、空间、画布、profile 或模型配置时，原目录会拒绝启动；先完成/排查旧任务再迁移，不要为重试不确定任务新建数据目录。
-- 默认最多 20 个未完成任务、1000 个持久任务、单文件 512 MiB；可在配置中设置 `maxQueue`、`maxJobs`、`maxMediaBytes`。数据保存在权限 0700 的目录中，包括提示词、任务身份及产物。不会保存即梦凭据和上游响应。没有自动清理/备份，应监控磁盘并在停止服务、确认历史任务不再需要后归档整个目录；丢弃记录会失去幂等保护。
-- 图片 URL 是有效期默认 1 小时的下载授权链接（可设置 `mediaTTL`），不包含渠道密钥；不要公开日志中的完整链接。视频走 New API 的鉴权下载接口。桥接服务不支持用户隔离/多租户，不直接把桥接密钥发给终端用户。
+- 桥接 API 仅供可信 New API 使用。`POST /v1/jobs` 要求 Bearer 和 `Idempotency-Key`，插件使用公开任务 ID。相同键和请求返回同一任务，冲突返回 409；不同客户端请求仍是不同生成。
+- 每笔任务先写入稳定节点/提交 ID；上传使用预先落盘的资源 UUID，重试使用同一身份。付费提交超时后只查询原 submit ID，不自动重提。
+- HTTP 创建后须收到第一次鉴权轮询才开始执行，避免网关未保存受理结果便消耗积分。排队任务须维持轮询租约（默认 15 秒），重启不恢复租约。网关正常任务轮询会续约，无需终端用户直接访问桥接。
+- 默认最多 2 个活动生成任务（`maxConcurrent`，1–8），所有进行中任务都会查询。没有租约的任务不会挡住其他活跃请求。HTTP 同时最多接纳 2 笔提交，其余返回 429，查询及下载仍可用。
+- 默认最多 20 个未完成任务、1000 个持久任务，排队最长 300 秒；分别由 `maxQueue`、`maxJobs`、`maxQueueWaitSeconds` 配置。未开始且过期的任务失败，不生成。
+- New API 超时应大于排队上限加 CLI 命令超时，连续轮询失败窗口应大于租约。租约不提供跨服务原子取消：网关终止与 CLI 受理同时发生仍可能消费，已提交任务不自动取消。
+- 每次执行检查账号/空间。`context_mismatch`、`cli_unavailable`、`model_unavailable` 表示等待修复；`reference_upload_pending` 使用原 UUID 恢复上传；准备结束后再次检查租约才允许生成。
+- `submission_uncertain`、`status_unavailable`、`manual_recovery_required` 应按存储的 submitId/projectId 只读检查 `operation status`。`absent` 不能证明从未扣费，不可换 ID 重跑。
+- `download_failed` 时保留进行中，修复导出/磁盘后重试下载；不重新生成，不把已消费的任务谎报失败。校验签名、大小及 SHA256 后才交付。
+- CLI 退出码 10（报价未批准）、明确拒绝或全部生成失败会终止任务；未知状态继续恢复。`GET /healthz` 只代表进程存活。
+- 正常退出等待 CLI 结束并释放锁。异常退出留下 `dataDir/.lock`，先验证记录的 PID 已退出再移除；一个目录只能一个进程。
+- 配置和存储绑定，修改账号、空间、画布、profile 或模型配置会拒绝旧目录。升级旧配置前先完成/排查旧任务，保留原记录及旧服务用于历史任务恢复，不可通过新建目录来重试不确定任务。
+- 数据目录权限 0700，文件权限 0600，保存提示词、输入文件、任务身份和视频；URL/base64 输入及 CLI 凭据不写入任务快照。默认单个产物最多 512 MiB（`maxMediaBytes`）。没有自动清理、备份或磁盘总额控制，须监控并按保留策略归档；删除任务记录会失去幂等保护。
+- 旧图片处理逻辑仅在桥接层保留用于历史数据兼容；新插件不提供图片创建或原图片协议。迁移时不要覆盖仍有图片任务的旧插件部署。
+- 导出水印由即梦账号/团队的导出设置控制，CLI 下载遵循该设置。修改设置后需重新下载；已缓存文件不会自动变更。
 
-## 测试
+## 验证状态
 
 ```sh
 npm test
-# 在仓库根目录执行，验证真实 New API JS 引擎和现有插件回归：
+# 仓库根目录：真实 New API JS 引擎及已有插件回归
 go test ./plugins
 ```
 
-自动化测试不消耗即梦积分。图片和视频完整链路已在本地部署验证；更换部署时仍应核验账号、空间、报价上限、下载安全策略和业务计费。本接入仍是开发版本。
+自动化测试使用模拟 CLI，不消耗积分。覆盖 8 个模型、JSON/multipart、输入校验、同键幂等、身份漂移、断线恢复、队列租约、部分成功结算、多产物下载、样片来源校验、上传恢复和 SSRF 边界。
+
+2026-10-28 已核验团队空间的全部 8 个实时模型；官方 CLI 对 23 个模型/模式组合的 `--dry-run` 验证通过，无联网写入或扣费。实际完整链路的既有付费验证为 Seedance 2.5、480p、5 秒：New API POST 创建、轮询完成、GET/HEAD 下载 200、Range 206、无令牌 401，产物 SHA256 一致，854×480、5.057 秒。该测试的 New API 用户价格为 0，即梦报价上限为 60 团队积分；测试后已恢复价格、禁用渠道及删除临时令牌。
+
+0.2.0 的其他模型、批量、参考素材生成和样片转正片尚未逐项付费生成验收；本次仅完成开发、自动化和只读/本地 CLI 验证，没有自动启用生产渠道或进行额外扣费。正式面向用户前仍需按管理员确认的预算进行真实生成、正价计费及长时间运行验收。

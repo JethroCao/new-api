@@ -134,7 +134,10 @@ test('HTTP auth, signed download expiry/tampering and content ranges', async t =
   assert.equal((await fetch(cfg.publicUrl + '/v1/jobs', { method: 'POST', headers, body: JSON.stringify({ ...request, n: 99 }) })).status, 400);
   const created = await fetch(cfg.publicUrl + '/v1/jobs', { method: 'POST', headers, body: JSON.stringify(request) });
   assert.equal(created.status, 202);
-  const job = await created.json(); await bridge.tick(); await bridge.tick();
+  const job = await created.json(); await bridge.tick();
+  assert.equal(bridge.get(job.id).status, 'queued');
+  await fetch(cfg.publicUrl + '/v1/jobs/' + job.id, { headers });
+  await bridge.tick(); await bridge.tick();
   const done = await (await fetch(cfg.publicUrl + '/v1/jobs/' + job.id, { headers })).json();
   assert.equal(done.status, 'completed');
   const url = done.data[0].url;
@@ -259,4 +262,157 @@ test('video uses the approved duration and only completes after verified MP4 dow
   assert.equal(bridge.get(job.id).status, 'completed');
   assert.equal(bridge.get(job.id).seconds, 10);
   assert.equal(bridge.jobs.get(job.id).files[0].mime, 'video/mp4');
+});
+
+const liveCatalog = JSON.parse(await readFile(new URL('./fixtures/video-models.json', import.meta.url), 'utf8'));
+const mp4 = Buffer.from('000000186674797069736f6d0000020069736f6d', 'hex');
+async function videoFixture(t, handler) {
+  const dir=await mkdtemp(join(tmpdir(),'dreamina-video-'));
+  t.after(()=>rm(dir,{recursive:true,force:true}));
+  const cfg=validateConfig({...config(dir),models:Object.fromEntries(liveCatalog.items.map(m=>[m.model,{kind:'video',model:m.model,maxCredits:100}]))});
+  const cli=async args=>{
+    if(args[0]==='space') return context;
+    if(args[0]==='model' && args[1]==='list') return liveCatalog;
+    if(args[0]==='model') return {matches:[{generation:{generationKind:'sample',mode:'t2v',draftPromotion:{params:[{name:'resolution',rule:{stringValues:['1080p']}}]}}}]};
+    return handler(args);
+  };
+  const bridge=await Bridge.open(cfg,cli);t.after(()=>bridge.close());await bridge.preflight();
+  return {bridge,cfg,cli,dir};
+}
+
+test('live catalogue validates all eight models and requested spec reaches CLI unchanged',async t=>{
+  const calls=[];
+  const {bridge}=await videoFixture(t,async a=>{calls.push(a);return {submission:{state:'accepted'}};});
+  const job=await bridge.submit({kind:'video',model:'wan_3.0',prompt:'海浪',resolution:'1080p',ratio:'9:16',seconds:12,n:3},'all-video');
+  await bridge.tick();
+  const args=calls.find(a=>a[0]==='node');
+  for(const flag of ['--model=wan_3.0','--resolution=1080P','--ratio=9:16','--duration=12','--count=3']) assert.ok(args.includes(flag),flag);
+  assert.equal(bridge.get(job.id).resolution,'1080P');
+  await assert.rejects(bridge.submit({kind:'video',model:'seedance_2.5',prompt:'x',resolution:'4k'},'bad'),/resolution/);
+});
+
+test('reference upload IDs survive restart and paid dispatch waits for a live gateway lease',async t=>{
+  const uploaded=[];let nodes=0;let fail=true;
+  const {bridge,cfg,cli,dir}=await videoFixture(t,async a=>{
+    if(a[0]==='resource' && a[1]==='upload') {
+      const id=a.find(x=>x.startsWith('--resource-id=')).slice(14);uploaded.push(id);
+      if(fail) throw new Error('upload transport lost');
+      return {resourceId:id,mediaType:'image'};
+    }
+    if(a[0]==='node'){nodes++;return {submission:{state:'accepted'}};}
+    throw new Error('unexpected command');
+  });
+  const job=await bridge.submit({kind:'video',model:'seedance_2.5',prompt:'x',mode:'first_last_frame',references:[{type:'image',url:'data:image/png;base64,'+png.toString('base64')}]},'ref');
+  await bridge.tick();assert.equal(nodes,0);
+  assert.equal((await readFile(join(dir,job.id+'.json'),'utf8')).includes('base64'),false);
+  await bridge.close();fail=false;
+  const recovered=await Bridge.open(cfg,cli);t.after(()=>recovered.close());await recovered.preflight();
+  await recovered.tick();assert.equal(nodes,0);
+  recovered.observe(job.id);await recovered.tick();
+  assert.equal(nodes,1);assert.equal(uploaded.length,2);assert.equal(uploaded[0],uploaded[1]);
+});
+
+test('unleased queue entries do not starve another live request and active tasks are polled',async t=>{
+  const {bridge,cfg}=await videoFixture(t,async a=>a[0]==='node'?{submission:{state:'accepted'}}:{state:'running',resources:[]});
+  cfg.maxConcurrent=2;
+  const a=await bridge.submit({kind:'video',model:'seedance_2.5',prompt:'a'},'a');
+  bridge.leases.delete(a.id);
+  const b=await bridge.submit({kind:'video',model:'seedance_2.5',prompt:'b'},'b');
+  await bridge.tick();assert.equal(bridge.get(b.id).status,'in_progress');
+  bridge.observe(a.id);await bridge.tick();assert.equal(bridge.get(a.id).status,'in_progress');
+});
+
+test('multi-video partial completion counts only verified downloads and exposes every output',async t=>{
+  const {bridge}=await videoFixture(t,async a=>{
+    if(a[0]==='node') return {submission:{state:'accepted'}};
+    if(a[0]==='operation')return {state:'failed',resources:[{resourceId:'good1',state:'succeeded'},{resourceId:'bad',state:'failed'},{resourceId:'good2',state:'succeeded'}]};
+    const path=a.find(x=>x.startsWith('--output=')).slice(9);await writeFile(path,mp4);
+    return {path,size:mp4.length,sha256:createHash('sha256').update(mp4).digest('hex')};
+  });
+  const j=await bridge.submit({kind:'video',model:'seedance_2.5',prompt:'x',seconds:10,n:3},'partial-video');
+  await bridge.tick();await bridge.tick();
+  assert.equal(bridge.get(j.id).status,'completed');assert.equal(bridge.get(j.id).video_count,2);assert.equal(bridge.get(j.id).n,3);
+});
+
+test('reference URLs cannot fetch local services and invalid media fails before paid CLI calls',async t=>{
+  let paid=0;
+  const {bridge}=await videoFixture(t,async a=>{if(a[0]==='node')paid++;throw new Error('unexpected');});
+  for(const url of ['https://127.0.0.1/a','https://169.254.169.254/meta','https://[::1]/a','https://localhost/a','data:image/png;base64,'+Buffer.from('<html>bad</html>').toString('base64')]) {
+    await assert.rejects(bridge.submit({kind:'video',model:'seedance_2.5',references:[{type:'image',url}]},'unsafe-'+url));
+  }
+  assert.equal(paid,0);
+});
+
+test('promotion resolves a local completed draft and never accepts arbitrary CLI resource IDs',async t=>{
+  let args;
+  const {bridge}=await videoFixture(t,async a=>{args=a;return {submission:{state:'accepted'}};});
+  const source=await bridge.submit({kind:'video',model:'seedance_2.5_draft',prompt:'x',seconds:12},'draft');
+  const saved=bridge.jobs.get(source.id);saved.status='completed';saved.files=[{resourceId:'draft-result'}];
+  const j=await bridge.submit({kind:'video',model:'seedance_2.5',mode:'promote',source_job_id:source.id,resolution:'1080p',ratio:'16:9',seconds:12,n:1,references:[]},'promote');
+  await bridge.tick();assert.deepEqual(args.slice(0,3),['node','promote','video-sample']);
+  assert.ok(args.includes('--node-id='+saved.nodeId));assert.ok(args.includes('--submit-id='+bridge.jobs.get(j.id).submitId));
+  assert.equal(bridge.get(source.id).warning.includes('7'),true);
+  await assert.rejects(bridge.submit({kind:'video',model:'seedance_2.5',mode:'promote',source_job_id:'unknown'},'bad-source'));
+});
+
+test('reference DNS checks every answer including mixed public/private addresses', async()=>{
+  const {publicAddress}=await import('./media-input.mjs');
+  assert.equal(await publicAddress(new URL('https://example.com/a'),async()=>[{address:'8.8.8.8',family:4}]),'8.8.8.8');
+  for(const address of ['10.0.0.1','100.64.0.1','127.1.2.3','172.16.1.1','192.168.1.1','0.250.250.254','224.1.1.1']) {
+    await assert.rejects(publicAddress(new URL('https://example.com/a'),async()=>[{address:'8.8.8.8',family:4},{address,family:4}]));
+  }
+  await assert.rejects(publicAddress(new URL('https://user:pass@example.com/a')));
+  await assert.rejects(publicAddress(new URL('https://example.com:8787/a')));
+});
+
+test('long reference upload cannot bypass gateway lease or cause a paid submission',async t=>{
+  t.mock.timers.enable({apis:['Date'],now:new Date('2026-01-01T00:00:00Z')});
+  let paid=0;
+  const {bridge}=await videoFixture(t,async a=>{
+    if(a[0]==='node')paid++;
+    t.mock.timers.tick(16000);
+    return {resourceId:a.find(x=>x.startsWith('--resource-id=')).slice(14),mediaType:'image'};
+  });
+  const j=await bridge.submit({kind:'video',model:'seedance_2.5',references:[{type:'image',url:'data:image/png;base64,'+png.toString('base64')}]},'slow-upload');
+  await bridge.tick();assert.equal(paid,0);assert.equal(bridge.get(j.id).status,'queued');
+});
+
+test('promotion uses the current official capability and parses its distinct submission envelope',async t=>{
+  const {bridge}=await videoFixture(t,async a=>{
+    if(a[0]==='node')return {submitId:a.find(x=>x.startsWith('--submit-id=')).slice(12),state:'accepted',errorCode:0,resourceIds:['promoted']};
+    throw new Error('unexpected');
+  });
+  const source=await bridge.submit({kind:'video',model:'seedance_2.5_draft',prompt:'x'},'draft-envelope');
+  const draft=bridge.jobs.get(source.id);draft.status='completed';draft.files=[{resourceId:'draft'}];
+  const j=await bridge.submit({kind:'video',model:'seedance_2.5',mode:'promote',source_job_id:source.id,resolution:'1080p',ratio:'16:9',seconds:5,n:1,references:[]},'promotion-envelope');
+  await bridge.tick();assert.equal(bridge.get(j.id).attention,undefined);
+});
+
+test('HTTP admission bounds buffered submissions while queries remain available',async t=>{
+  const {bridge}=await videoFixture(t,async()=>{throw new Error('no CLI mutation');});
+  let unblock, entered, count=0;
+  const held=new Promise(r=>{unblock=r;}), both=new Promise(r=>{entered=r;});
+  bridge.submit=async()=>{count++;if(count===2)entered();if(count<3)await held;return {id:'accepted'};};
+  const server=createServer(bridge);
+  await new Promise(r=>server.listen(0,'127.0.0.1',r));
+  t.after(()=>new Promise(r=>server.close(r)));
+  const url='http://127.0.0.1:'+server.address().port;
+  const send=()=>fetch(url+'/v1/jobs',{method:'POST',headers:{Authorization:'Bearer '+token,'Content-Type':'application/json'},body:'{}'});
+  const first=send(),second=send();
+  try {
+    await both;
+    assert.equal((await fetch(url+'/healthz',{headers:{Authorization:'Bearer '+token}})).status,200);
+    assert.equal((await send()).status,429);
+  } finally {unblock();await Promise.all([first,second]);}
+});
+
+test('reference admission aborts during DNS without holding the queue indefinitely',async()=>{
+  const {publicAddress}=await import('./media-input.mjs');
+  const controller=new AbortController();
+  let release;
+  const dns=new Promise(r=>{release=r;});
+  const pending=publicAddress(new URL('https://example.com/a'),()=>dns,controller.signal);
+  controller.abort(new Error('Reference deadline exceeded'));
+  release([{address:'8.8.8.8',family:4}]);
+  await assert.rejects(pending,/deadline/);
 });

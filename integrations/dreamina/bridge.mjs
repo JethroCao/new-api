@@ -3,6 +3,8 @@ import { spawn } from 'node:child_process';
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { mkdir, open, readFile, readdir, rename, unlink, stat } from 'node:fs/promises';
 import { createReadStream } from 'node:fs';
+import { VIDEO_MODELS, normalizeVideo } from './plugin.js';
+import { readReference } from './media-input.mjs';
 import { isAbsolute, join, resolve } from 'node:path';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -19,7 +21,7 @@ function equal(a, b) {
 export function validateConfig(input) {
   const c = { host: '127.0.0.1', port: 8787, profile: 'default', region: 'cn',
     pollMs: 5000, commandTimeoutMs: 120000, maxQueue: 20, maxJobs: 1000,
-    maxMediaBytes: 512 * 1024 * 1024, mediaTTL: 3600, maxQueueWaitSeconds: 300, leaseSeconds: 15, ...input };
+    maxConcurrent: 2, maxInputBytes: 64 * 1024 * 1024, maxMediaBytes: 512 * 1024 * 1024, mediaTTL: 3600, maxQueueWaitSeconds: 300, leaseSeconds: 15, ...input };
   if (typeof c.token !== 'string' || c.token.length < 32 || /\s/.test(c.token)) fail('config token must have at least 32 non-whitespace characters');
   if (!UUID.test(c.projectId) || !/^\d+$/.test(c.userId || '')) fail('config projectId and userId are required');
   if (c.space !== 'personal' && !/^team:\d+$/.test(c.space || '')) fail('config space must be personal or team:<id>');
@@ -30,12 +32,16 @@ export function validateConfig(input) {
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash || url.pathname !== '/') fail('invalid config publicUrl');
   c.publicUrl = url.origin;
   for (const [key, min, max] of [['port', 1, 65535], ['pollMs', 1000, 60000], ['commandTimeoutMs', 1000, 600000],
-    ['maxQueue', 1, 100], ['maxJobs', 1, 100000], ['maxMediaBytes', 1, 1073741824], ['mediaTTL', 60, 86400],
+    ['maxQueue', 1, 100], ['maxConcurrent', 1, 8], ['maxInputBytes', 1, 64 * 1024 * 1024], ['maxJobs', 1, 100000], ['maxMediaBytes', 1, 1073741824], ['mediaTTL', 60, 86400],
     ['maxQueueWaitSeconds', 1, 600], ['leaseSeconds', 1, 15]]) {
     if (!integer(c[key], min, max)) fail('invalid config ' + key);
   }
   if (!c.models || Array.isArray(c.models) || !Object.keys(c.models).length) fail('config models are required');
   for (const [alias, m] of Object.entries(c.models)) {
+    if (Object.hasOwn(VIDEO_MODELS, alias)) {
+      if (m.kind !== 'video' || m.model !== alias || !integer(m.maxCredits, 0, 100000)) fail('invalid config model: ' + alias);
+      continue;
+    }
     if (!['dreamina-image', 'dreamina-video'].includes(alias) || m.kind !== alias.slice(9) || !/^[A-Za-z0-9_.-]{1,160}$/.test(m.model || '') ||
         !/^\d{1,2}:\d{1,2}$/.test(m.ratio || '') || !/^[A-Za-z0-9]{1,16}$/.test(m.resolution || '') || !integer(m.maxCredits, 0, 100000)) fail('invalid config model: ' + alias);
     const values = m.kind === 'image' ? m.counts : m.durations;
@@ -119,6 +125,7 @@ export class Bridge {
     this.contextKey = hash(JSON.stringify([config.profile, config.region, config.userId, config.space, config.projectId, config.models]));
     this.jobs = new Map(); this.keys = new Map(); this.admissions = Promise.resolve();
     this.promptLimits = new Map();
+    this.videoCatalog = new Map();
     this.leases = new Map(); // Deliberately not restored after downtime.
   }
 
@@ -138,9 +145,16 @@ export class Bridge {
 
   async preflight() {
     await this.checkContext();
+    const catalogues = new Map();
     for (const [alias, m] of Object.entries(this.config.models)) {
-      const list = await this.cli(['model', 'list', '--type=' + m.kind]);
+      if (!catalogues.has(m.kind)) catalogues.set(m.kind, await this.cli(['model', 'list', '--type=' + m.kind]));
+      const list = catalogues.get(m.kind);
       const model = list.items?.find(item => item.model === m.model);
+      if (Object.hasOwn(VIDEO_MODELS, alias)) {
+        if (!model?.modes?.length) fail('configured model unavailable: ' + alias, 503);
+        this.videoCatalog.set(alias, model);
+        continue;
+      }
       const mode = model?.modes?.find(item => item.name === (m.kind === 'image' ? 't2i' : 't2v'));
       if (!mode) fail('configured model/mode unavailable: ' + alias, 503);
       const flags = new Map((mode.flags || []).map(f => [f.flag, f]));
@@ -156,9 +170,48 @@ export class Bridge {
     }
   }
 
+  validateLiveVideo(request) {
+    const model = this.videoCatalog.get(request.model);
+    if (!model) fail('video model catalogue unavailable', 503);
+    if (request.mode === 'promote') return; // Promotion has its own live spec.
+    const matching = model.modes.filter(mode => mode.name === request.mode);
+    const valid = matching.some(mode => {
+      const flags = new Map((mode.flags || []).map(f => [f.flag, f]));
+      for (const [name, value] of [['ratio',request.ratio],['resolution',request.resolution],['duration',request.seconds],['count',request.n]]) {
+        const spec = flags.get('--'+name);
+        if (!spec || (spec.values ? !spec.values.includes(value) : !integer(value,spec.min,spec.max) || spec.step && (value-spec.min)%spec.step!==0)) return false;
+      }
+      const prompt = flags.get('--prompt');
+      if (!prompt || request.prompt.length > prompt.maxLength || request.prompt.length < (prompt.minLength || 0)) return false;
+      const refs=request.references, caps=mode.references;
+      if (!caps) return refs.length===0;
+      if (refs.length<caps.min || refs.length>caps.max) return false;
+      for (const type of ['image','video','audio']) {
+        const count=refs.filter(r=>r.type===type).length, rule=(caps.types||[]).find(t=>t.mediaType===type);
+        if (rule ? count<rule.min || count>rule.max : count>0) return false;
+      }
+      return !caps.requireAnyOfTypes || refs.some(r=>caps.requireAnyOfTypes.includes(r.type));
+    });
+    if (!valid) fail('requested parameters are not available in the live CLI model specification');
+  }
+
   validate(body) {
     if (!body || typeof body !== 'object' || Array.isArray(body)) fail('invalid request body');
-    const m = this.config.models[body.model];
+    if (Object.hasOwn(VIDEO_MODELS, body.model)) {
+      if (!Object.hasOwn(this.config.models, body.model)) fail('unsupported model/kind');
+      if (body.mode === 'promote') {
+        const source = this.jobs.get(body.source_job_id);
+        if (Object.keys(body).some(k => !['kind','model','mode','source_job_id','resolution','ratio','seconds','n','references'].includes(k)) ||
+            body.model !== 'seedance_2.5' || body.kind !== 'video' || !source || source.status !== 'completed' || source.request.model !== 'seedance_2.5_draft' || source.request.n !== 1 || source.files.length !== 1 ||
+            body.resolution !== '1080p' || body.seconds !== source.request.seconds || body.ratio !== source.request.ratio || body.n !== 1 || !Array.isArray(body.references) || body.references.length) fail('invalid draft promotion source or parameters');
+        return {kind:'video',model:body.model,mode:'promote',source_job_id:source.id,resolution:'1080p',ratio:source.request.ratio,seconds:source.request.seconds,n:1,references:[]};
+      }
+      let r;
+      try { r = normalizeVideo(body, body.model, false); } catch(e) { fail(e.message); }
+      this.validateLiveVideo(r);
+      return r;
+    }
+    const m = Object.hasOwn(this.config.models, body.model) ? this.config.models[body.model] : undefined;
     if (!m || m.kind !== body.kind) fail('unsupported model/kind');
     const allowed = ['model', 'kind', 'prompt', ...(m.kind === 'image' ? ['n'] : ['seconds'])];
     if (Object.keys(body).some(k => !allowed.includes(k))) fail('unsupported request field');
@@ -170,7 +223,7 @@ export class Bridge {
     return { kind: m.kind, model: body.model, prompt: body.prompt, n: count, ...(seconds === undefined ? {} : { seconds }) };
   }
 
-  submit(body, key) {
+  submit(body, key, waitForGateway = false) {
     const op = this.admissions.then(async () => {
       if (this.closed) fail('bridge closed', 503);
       const request = this.validate(body);
@@ -184,10 +237,29 @@ export class Bridge {
       if (this.jobs.size >= this.config.maxJobs || [...this.jobs.values()].filter(j => !terminal(j)).length >= this.config.maxQueue) fail('queue/storage capacity reached', 429);
       const job = { id: randomUUID(), key: keyHash, digest, context: this.contextKey, request,
         nodeId: 'node_' + Array.from(randomBytes(10), b => '0123456789abcdefghjkmnpqrstvwxyz'[b & 31]).join(''), updateId: randomUUID(), submitId: randomUUID(),
-        status: 'queued', created_at: Math.floor(Date.now() / 1000), files: [] };
-      await this.save(job);
+        status: 'queued', created_at: Math.floor(Date.now() / 1000), files: [], inputs: [] };
+      // Only local file identities/hashes are persisted. In particular, signed
+      // input URLs and base64 payloads never enter job snapshots or responses.
+      try {
+        let remaining = this.config.maxInputBytes;
+        const inputDeadline = AbortSignal.timeout(30000);
+        for (const ref of request.references || []) {
+          let media;
+          try { media = await readReference(ref, remaining, inputDeadline); } catch { fail('invalid or unavailable reference media'); }
+          remaining -= media.bytes.length;
+          const resourceId = randomUUID(), filename = job.id + '-input-' + job.inputs.length + '.' + media.extension;
+          const file = await open(join(this.config.dataDir, filename), 'wx', 0o600);
+          try { await file.writeFile(media.bytes); await file.sync(); } finally { await file.close(); }
+          job.inputs.push({resourceId,filename,type:ref.type,sha256:hash(media.bytes),uploaded:false});
+        }
+        if (request.references) request.references = job.inputs.map(input => ({type:input.type}));
+        await this.save(job);
+      } catch(e) {
+        for (const input of job.inputs) await unlink(join(this.config.dataDir,input.filename)).catch(()=>{});
+        throw e;
+      }
       this.jobs.set(job.id, job); this.keys.set(keyHash, job.id);
-      this.leases.set(job.id, Date.now() + this.config.leaseSeconds * 1000);
+      if (!waitForGateway) this.leases.set(job.id, Date.now() + this.config.leaseSeconds * 1000);
       return this.get(job.id);
     });
     this.admissions = op.catch(() => {});
@@ -201,9 +273,13 @@ export class Bridge {
     if (!j) fail('job not found', 404);
     return { id: j.id, object: j.request.kind === 'video' ? 'video' : 'image', model: j.request.model,
       status: j.status, created_at: j.created_at, completed_at: j.completed_at,
+      n: j.request.n, mode:j.request.mode, ratio:j.request.ratio, resolution:j.request.resolution,
+      video_count:j.request.kind === 'video' && j.status === 'completed' ? j.files.length : 0,
+      reference_video:(j.request.references || []).some(r=>r.type==='video'),
+      ...(j.request.model === 'seedance_2.5_draft' ? {warning:'样片最长存储 7 天，过期后不可再生成正片；具体期限以即梦服务端为准'} : {}),
       seconds: j.request.seconds, image_count: j.status === 'completed' ? j.files.length : j.request.n,
       progress: j.status === 'completed' ? 100 : 0, attention: j.attention, error: j.error,
-      data: j.status === 'completed' ? j.files.map((f, i) => ({ url: this.mediaURL(j.id, i) })) : [] };
+      data: j.status === 'completed' && j.request.kind === 'image' ? j.files.map((f, i) => ({ url: this.mediaURL(j.id, i) })) : [] };
   }
 
   observe(id) {
@@ -233,12 +309,13 @@ export class Bridge {
         this.failed(queued, 'queue_expired'); await this.save(queued);
       }
     }
-    const job = [...this.jobs.values()].find(j => !terminal(j));
-    if (!job) return;
-    if (job.status === 'queued' && !(this.leases.get(job.id) > Date.now())) {
-      if (job.attention !== 'awaiting_gateway') { job.attention = 'awaiting_gateway'; await this.save(job); }
-      return;
-    }
+    for (const active of this.jobs.values()) if (active.status === 'in_progress') await this.processJob(active);
+    if ([...this.jobs.values()].filter(j => j.status === 'in_progress').length >= this.config.maxConcurrent) return;
+    const job = [...this.jobs.values()].find(j => j.status === 'queued' && this.leases.get(j.id) > Date.now());
+    if (job) await this.processJob(job);
+  }
+
+  async processJob(job) {
     try { await this.checkContext(); } catch (error) {
       job.attention = error.message === 'context_mismatch' ? 'context_mismatch' : 'cli_unavailable';
       await this.save(job); return;
@@ -251,20 +328,60 @@ export class Bridge {
         this.failed(job, 'queue_expired'); await this.save(job); return;
       }
       if (!(this.leases.get(job.id) > Date.now())) { job.attention = 'awaiting_gateway'; await this.save(job); return; }
+      if (Object.hasOwn(VIDEO_MODELS, job.request.model)) {
+        try {
+          const list = await this.cli(['model','list','--type=video']);
+          const spec = list.items?.find(m => m.model===job.request.model);
+          if (!spec) fail('live model unavailable');
+          this.videoCatalog.set(job.request.model,spec);
+          this.validateLiveVideo(job.request);
+          if (job.request.mode === 'promote') {
+            const details = await this.cli(['model','seedance_2.5_draft']);
+            const source = this.jobs.get(job.request.source_job_id);
+            const generation = details.matches?.map(m=>m.generation).find(g=>g?.generationKind==='sample' && g.mode===source.request.mode);
+            const values = generation?.draftPromotion?.params?.find(p=>p.name==='resolution')?.rule?.stringValues;
+            if (!values?.includes(job.request.resolution)) fail('promotion resolution unavailable');
+          }
+        } catch { job.attention='model_unavailable'; await this.save(job); return; }
+        try {
+          for (const input of job.inputs || []) {
+            if(input.uploaded) continue;
+            const path=join(this.config.dataDir,input.filename);
+            if(hash(await readFile(path))!==input.sha256) fail('input checksum mismatch');
+            const result=await this.cli(['resource','upload','--file='+path,'--type='+input.type,'--project-id='+this.config.projectId,'--resource-id='+input.resourceId]);
+            if(result.resourceId!==input.resourceId || result.mediaType!==input.type) fail('input upload mismatch');
+            input.uploaded=true; await this.save(job);
+          }
+        } catch { job.attention='reference_upload_pending'; await this.save(job); return; }
+        // Preparation can take longer than the lease. Never generate for a
+        // gateway that abandoned a request while it was downloading/uploading.
+        if (Date.now() >= (job.created_at+this.config.maxQueueWaitSeconds)*1000 || !(this.leases.get(job.id)>Date.now())) {
+          job.attention='awaiting_gateway';await this.save(job);return;
+        }
+      }
       // Durable transition BEFORE any remote mutation. A crash from here on
       // only permits read-only recovery of this exact submit identity.
       job.status = 'in_progress';
       await this.save(job);
       const r = job.request, m = this.config.models[r.model];
-      const args = ['node', 'create', r.kind, '--project-id=' + this.config.projectId,
+      const video = Object.hasOwn(VIDEO_MODELS, r.model);
+      const args = r.mode === 'promote' ? ['node','promote','video-sample','--project-id='+this.config.projectId,
+        '--node-id='+this.jobs.get(r.source_job_id).nodeId,'--submit-id='+job.submitId,'--resolution='+r.resolution,
+        '--title=Video promotion','--credit-ceiling='+m.maxCredits] :
+        ['node', 'create', r.kind, '--project-id=' + this.config.projectId,
         '--node-id=' + job.nodeId, '--update-id=' + job.updateId, '--submit-id=' + job.submitId,
-        '--mode=' + (r.kind === 'image' ? 't2i' : 't2v'), '--model=' + m.model,
-        '--prompt=' + r.prompt, '--ratio=' + m.ratio, '--resolution=' + m.resolution,
-        ...(r.kind === 'image' ? ['--count=' + r.n] : ['--duration=' + r.seconds]),
+        '--mode=' + (video ? r.mode : r.kind === 'image' ? 't2i' : 't2v'), '--model=' + m.model,
+        '--prompt=' + r.prompt, '--ratio=' + (video ? r.ratio : m.ratio), '--resolution=' + (video ? r.resolution : m.resolution),
+        '--count='+r.n, ...(r.kind === 'video' ? ['--duration=' + r.seconds] : []),
+        ...(video ? ['--title=Video generation', ...(job.inputs || []).map(input=>'--ref=res:'+input.resourceId)] : []),
         '--credit-ceiling=' + m.maxCredits, '--run'];
       try {
         const result = await this.cli(args);
-        if (String(result.submission?.state).toLowerCase() === 'rejected') this.failed(job, 'submission_rejected');
+        if (r.mode === 'promote') {
+          if (result.submitId !== job.submitId) job.attention = 'submission_uncertain';
+          else if (String(result.state).toLowerCase() === 'rejected') this.failed(job,'submission_rejected');
+          else if (!['accepted','completed','in_progress'].includes(String(result.state).toLowerCase())) job.attention='submission_uncertain';
+        } else if (String(result.submission?.state).toLowerCase() === 'rejected') this.failed(job, 'submission_rejected');
         else if (!result.submission || result.submission.submitId && result.submission.submitId !== job.submitId) job.attention = 'submission_uncertain';
       } catch (error) {
         // Exit 10 is documented as quotation awaiting approval, without debit.
@@ -358,7 +475,10 @@ async function content(bridge, req, res, id, index) {
 }
 
 export function createServer(bridge) {
-  return httpServer({ requestTimeout: 15000, headersTimeout: 10000, maxHeaderSize: 8192 }, async (req, res) => {
+  // Bound base64 buffers and the serialized admission backlog independently
+  // of generation concurrency. Queries/downloads remain available under load.
+  let admissions = 0;
+  return httpServer({ requestTimeout: 120000, headersTimeout: 10000, maxHeaderSize: 8192 }, async (req, res) => {
     try {
       const url = new URL(req.url, 'http://bridge.local');
       const media = /^\/v1\/jobs\/([0-9a-f-]{36})\/content\/(\d{1,2})$/.exec(url.pathname);
@@ -372,11 +492,15 @@ export function createServer(bridge) {
       if (req.method === 'GET' && url.pathname === '/healthz') return json(res, 200, { status: 'ok', queued: [...bridge.jobs.values()].filter(j => !terminal(j)).length });
       if (req.method === 'POST' && url.pathname === '/v1/jobs') {
         if ((req.headers['content-type'] || '').split(';')[0].trim() !== 'application/json') fail('JSON required', 415);
-        const chunks = []; let size = 0;
-        for await (const chunk of req) { size += chunk.length; if (size > 65536) fail('body too large', 413); chunks.push(chunk); }
-        let body;
-        try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { fail('invalid JSON'); }
-        return json(res, 202, await bridge.submit(body, req.headers['idempotency-key']));
+        if (admissions >= 2) fail('submission admission capacity reached', 429);
+        admissions++;
+        try {
+          const chunks = []; let size = 0;
+          for await (const chunk of req) { size += chunk.length; if (size > Math.ceil(bridge.config.maxInputBytes * 4 / 3) + 262144) fail('body too large', 413); chunks.push(chunk); }
+          let body;
+          try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { fail('invalid JSON'); }
+          return json(res, 202, await bridge.submit(body, req.headers['idempotency-key'], true));
+        } finally { admissions--; }
       }
       const query = /^\/v1\/jobs\/([0-9a-f-]{36})$/.exec(url.pathname);
       if (req.method === 'GET' && query) return json(res, 200, bridge.observe(query[1]));
