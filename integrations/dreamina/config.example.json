@@ -1,0 +1,16 @@
+{
+  "cli": "/absolute/path/to/dreamina-canvas",
+  "profile": "new-api",
+  "region": "cn",
+  "userId": "YOUR_NUMERIC_USER_ID",
+  "space": "personal",
+  "projectId": "YOUR_CANVAS_UUID",
+  "dataDir": "/absolute/path/to/dreamina-bridge-data",
+  "host": "127.0.0.1",
+  "port": 8787,
+  "publicUrl": "http://localhost:8787",
+  "models": {
+    "dreamina-image": { "kind": "image", "model": "seedream_4.0", "ratio": "1:1", "resolution": "2K", "counts": [1, 2, 3, 4], "maxCredits": 0 },
+    "dreamina-video": { "kind": "video", "model": "seedance_2.0_mini", "ratio": "16:9", "resolution": "720p", "durations": [5, 10], "maxCredits": 0 }
+  }
+}
