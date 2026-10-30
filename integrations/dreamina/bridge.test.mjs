@@ -543,3 +543,19 @@ test('explicit submission rejection keeps the upstream reason', async t => {
   await bridge.tick();
   assert.deepEqual(bridge.get(j.id).error,{code:'submission_rejected',message:'Unsupported reference image',upstream_code:'INPUT_REJECTED'});
 });
+
+test('copyright rejection 20115 has Chinese text in task logs and public video errors', async t => {
+  const plugin = await import('./plugin.js');
+  for (const code of [20115, '20115']) {
+    const {bridge}=await videoFixture(t,async a=>a[0]==='node'
+      ? {submission:{state:'accepted'}}
+      : {state:'failed',resources:[{state:'failed',resourceId:'r',serviceCode:code,errorMessage:'Dreamina service error: 20115'}]});
+    const job=await bridge.submit({kind:'video',model:'seedance_2.5',prompt:'waves'},'copyright-'+code);
+    await bridge.tick();await bridge.tick();
+    const body=bridge.get(job.id);
+    const parsed=plugin.parseTaskResult({},body,{status:200});
+    assert.equal(parsed.reason,'20115:本次生成的输出视频未通过版权审核');
+    const output=plugin.protocols.openai_video.render({},{status:'FAILURE',fail_reason:parsed.reason,data:body});
+    assert.deepEqual(output.error,{code:'video_generation_failed',message:'20115:本次生成的输出视频未通过版权审核',upstream_code:code});
+  }
+});

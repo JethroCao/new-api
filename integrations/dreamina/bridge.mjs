@@ -574,6 +574,8 @@ export class Bridge {
   failed(job, code, ...sources) {
     const upstream = upstreamError(sources);
     let message = upstream.message || (upstream.code !== undefined ? 'Dreamina service error: ' + upstream.code : code.replaceAll('_', ' '));
+    // Operator-confirmed meaning; keep the machine-readable upstream code.
+    if (String(upstream.code) === '20115') message = '20115:本次生成的输出视频未通过版权审核';
     // Public error text is retained; known credentials are never echoed.
     message = message.replaceAll(this.config.token, '[redacted]')
       .replace(/Bearer\s+[A-Za-z0-9._~+\/-]+=*/gi, 'Bearer [redacted]')

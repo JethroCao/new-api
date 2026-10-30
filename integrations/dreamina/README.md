@@ -204,7 +204,7 @@ New API 内容代理另行应用全局 `fetch_setting`，渠道 Base URL 不会�
 - 每次执行检查账号/空间。`context_mismatch`、`cli_unavailable`、`model_unavailable` 表示等待修复；`reference_upload_pending` 使用原 UUID 恢复上传；准备结束后再次检查租约才允许生成。
 - `submission_uncertain`、`status_unavailable`、`manual_recovery_required` 应按存储的 submitId/projectId 只读检查 `operation status`。`absent` 不能证明从未扣费，不可换 ID 重跑。
 - `download_failed` 时保留进行中，修复导出/磁盘后重试下载；不重新生成，不把已消费的任务谎报失败。校验签名、大小及 SHA256 后才交付。
-- 明确失败保留上游公开错误码和文案；任务日志显示文案，视频 API 在兼容原有 `error.code` 的同时返回 `error.upstream_code`。只有错误码时显示 `Dreamina service error: <code>`，不猜测中文含义。仅提取错误码及文案，过滤文案中的认证凭据，不转发上游完整载荷；历史已终结记录不自动改写。
+- 明确失败保留上游公开错误码；任务日志显示文案，视频 API 在兼容原有 `error.code` 的同时返回 `error.upstream_code`。按运营方确认的含义，`20115` 显示为 `20115:本次生成的输出视频未通过版权审核`；其他错误保留上游文案，只有错误码时显示 `Dreamina service error: <code>`，不猜测含义。仅提取错误码及文案，过滤认证凭据，不转发上游完整载荷。运行时不自动改写历史终态；本次发布单独备份并修正历史 20115 的同款英文提示，不改变任务状态或计费。
 - CLI 退出码 10（报价未批准）、明确拒绝或全部生成失败会终止任务；未知状态继续恢复。`GET /healthz` 只代表进程存活。
 - 正常退出等待 CLI 结束并释放锁。异常退出留下 `dataDir/.lock`，先验证记录的 PID 已退出再移除；一个目录只能一个进程。
 - 配置和存储绑定，修改账号、空间、画布、profile 或模型配置会拒绝旧目录。升级旧配置前先完成/排查旧任务，保留原记录及旧服务用于历史任务恢复，不可通过新建目录来重试不确定任务。
