@@ -1,4 +1,5 @@
 import { test } from 'node:test';
+import { request as httpRequest } from 'node:http';
 import assert from 'node:assert/strict';
 import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -214,18 +215,6 @@ test('HTML masquerading as generated media is never exposed as a completed artif
   assert.deepEqual(bridge.get(job.id).data, []);
 });
 
-test('expired queued work is never submitted after the gateway may have abandoned it', async t => {
-  t.mock.timers.enable({ apis: ['Date'], now: new Date('2026-01-01T00:00:00Z') });
-  let generations = 0;
-  const { bridge, cfg } = await fixture(t, async args => { if (args[0] === 'node') generations++; return context; });
-  cfg.maxQueueWaitSeconds = 1;
-  const job = await bridge.submit(request, 'expired');
-  t.mock.timers.tick(2000);
-  await bridge.tick();
-  assert.equal(generations, 0);
-  assert.equal(bridge.get(job.id).status, 'failed');
-  assert.equal(bridge.get(job.id).error.code, 'queue_expired');
-});
 
 test('restart does not start queued work until gateway polling renews its lease', async t => {
   let generations = 0;
@@ -266,10 +255,10 @@ test('video uses the approved duration and only completes after verified MP4 dow
 
 const liveCatalog = JSON.parse(await readFile(new URL('./fixtures/video-models.json', import.meta.url), 'utf8'));
 const mp4 = Buffer.from('000000186674797069736f6d0000020069736f6d', 'hex');
-async function videoFixture(t, handler) {
+async function videoFixture(t, handler, overrides = {}) {
   const dir=await mkdtemp(join(tmpdir(),'dreamina-video-'));
   t.after(()=>rm(dir,{recursive:true,force:true}));
-  const cfg=validateConfig({...config(dir),models:Object.fromEntries(liveCatalog.items.map(m=>[m.model,{kind:'video',model:m.model,maxCredits:100}]))});
+  const cfg=validateConfig({...config(dir),models:Object.fromEntries(liveCatalog.items.map(m=>[m.model,{kind:'video',model:m.model,maxCredits:100}])),...overrides});
   const cli=async args=>{
     if(args[0]==='space') return context;
     if(args[0]==='model' && args[1]==='list') return liveCatalog;
@@ -279,6 +268,67 @@ async function videoFixture(t, handler) {
   const bridge=await Bridge.open(cfg,cli);t.after(()=>bridge.close());await bridge.preflight();
   return {bridge,cfg,cli,dir};
 }
+
+test('30-minute queue window allows late starts, expires waiting work, and preserves running jobs', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: new Date('2026-01-01T00:00:00Z') });
+  let generations = 0;
+  const {bridge} = await videoFixture(t, async args => {
+    if (args[0] === 'node') { generations++; return {submission:{state:'accepted'}}; }
+    return {state:'running',resources:[]};
+  }, {maxQueueWaitSeconds:1800});
+  const running = await bridge.submit({kind:'video',model:'seedance_2.5',prompt:'waves'}, 'late-start');
+  const waiting = await bridge.submit({kind:'video',model:'seedance_2.5',prompt:'waves'}, 'expires');
+  t.mock.timers.tick(1799000);
+  bridge.observe(running.id);
+  await bridge.tick();
+  assert.equal(generations, 1);
+  assert.equal(bridge.get(running.id).status, 'in_progress');
+  t.mock.timers.tick(1000);
+  bridge.observe(waiting.id);
+  await bridge.tick();
+  assert.equal(generations, 1);
+  assert.equal(bridge.get(waiting.id).error.code, 'queue_expired');
+  assert.equal(bridge.get(running.id).status, 'in_progress');
+});
+
+test('unlimited credit approval must be an explicit server boolean', () => {
+  for (const value of ['true', 'false', 1, null]) {
+    assert.throws(() => validateConfig({...config('/tmp/dreamina-config-test'), unlimitedCredits: value}), /unlimitedCredits/);
+  }
+});
+
+test('server unlimited approval accepts quotes above the old cap for generation and promotion', async t => {
+  for (const unlimitedCredits of [false, true]) {
+    for (const promote of [false, true]) {
+      await t.test(`${unlimitedCredits ? 'unlimited' : 'capped'} ${promote ? 'promotion' : 'generation'}`, async t => {
+        const {bridge} = await videoFixture(t, async args => {
+          assert.equal(args[0], 'node');
+          // Simulate the documented CLI response to a quote above 100 credits.
+          if (!args.includes('--yes')) {
+            assert.ok(args.includes('--credit-ceiling=100'));
+            throw Object.assign(new Error('quote exceeds ceiling'), {exitCode: 10});
+          }
+          assert.equal(args.some(a => a.startsWith('--credit-ceiling=')), false);
+          return promote
+            ? {submitId: args.find(a => a.startsWith('--submit-id=')).slice(12), state: 'accepted'}
+            : {submission: {state: 'accepted'}};
+        }, {unlimitedCredits});
+        let body = {kind:'video', model:'seedance_2.5', prompt:'waves', seconds:10, resolution:'720p'};
+        if (promote) {
+          const source = await bridge.submit({kind:'video',model:'seedance_2.5_draft',prompt:'waves',seconds:10}, 'source');
+          const draft = bridge.jobs.get(source.id);
+          draft.status = 'completed'; draft.files = [{resourceId:'draft-result'}];
+          body = {kind:'video', model:'seedance_2.5', mode:'promote', source_job_id:source.id, resolution:'1080p', ratio:'16:9', seconds:10, n:1, references:[]};
+        }
+        await assert.rejects(bridge.submit({...body, unlimitedCredits:true}, 'client-override'));
+        const job = await bridge.submit(body, 'credit-policy');
+        await bridge.tick();
+        assert.equal(bridge.get(job.id).status, unlimitedCredits ? 'in_progress' : 'failed');
+        assert.equal(bridge.get(job.id).error?.code, unlimitedCredits ? undefined : 'credit_approval_required');
+      });
+    }
+  }
+});
 
 test('live catalogue validates all eight models and requested spec reaches CLI unchanged',async t=>{
   const calls=[];
@@ -320,6 +370,23 @@ test('unleased queue entries do not starve another live request and active tasks
   const b=await bridge.submit({kind:'video',model:'seedance_2.5',prompt:'b'},'b');
   await bridge.tick();assert.equal(bridge.get(b.id).status,'in_progress');
   bridge.observe(a.id);await bridge.tick();assert.equal(bridge.get(a.id).status,'in_progress');
+});
+
+test('configured 200-slot scheduler admits and starts 200 jobs, then rejects overflow', async t => {
+  const {bridge} = await videoFixture(t, async args => args[0] === 'node'
+    ? {submission:{state:'accepted'}} : {state:'running',resources:[]},
+  {maxConcurrent:200,maxQueue:200});
+  const jobs = [];
+  for (let i = 0; i < 200; i++) {
+    jobs.push(await bridge.submit({kind:'video',model:'seedance_2.5',prompt:'waves'}, 'concurrency-' + i));
+  }
+  await assert.rejects(bridge.submit({kind:'video',model:'seedance_2.5',prompt:'waves'}, 'overflow'),
+    error => error.status === 429);
+  for (let i = 0; i < 200; i++) {
+    for (const job of jobs) bridge.observe(job.id);
+    await bridge.tick();
+  }
+  assert.equal(jobs.filter(job => bridge.get(job.id).status === 'in_progress').length, 200);
 });
 
 test('multi-video partial completion counts only verified downloads and exposes every output',async t=>{
@@ -388,22 +455,38 @@ test('promotion uses the current official capability and parses its distinct sub
   await bridge.tick();assert.equal(bridge.get(j.id).attention,undefined);
 });
 
-test('HTTP admission bounds buffered submissions while queries remain available',async t=>{
-  const {bridge}=await videoFixture(t,async()=>{throw new Error('no CLI mutation');});
+for (const limit of [2, 200]) test('HTTP admission limit '+limit+' bounds submissions while queries remain available',async t=>{
+  const {bridge}=await videoFixture(t,async()=>{throw new Error('no CLI mutation');},limit===2?{}:{maxAdmissions:limit});
   let unblock, entered, count=0;
-  const held=new Promise(r=>{unblock=r;}), both=new Promise(r=>{entered=r;});
-  bridge.submit=async()=>{count++;if(count===2)entered();if(count<3)await held;return {id:'accepted'};};
+  const held=new Promise(r=>{unblock=r;});
+  bridge.submit=async()=>{count++;entered?.();if(count<=limit)await held;return {id:'accepted'};};
   const server=createServer(bridge);
   await new Promise(r=>server.listen(0,'127.0.0.1',r));
-  t.after(()=>new Promise(r=>server.close(r)));
+  t.after(()=>{unblock();server.closeAllConnections();return new Promise(r=>server.close(r));});
   const url='http://127.0.0.1:'+server.address().port;
-  const send=()=>fetch(url+'/v1/jobs',{method:'POST',headers:{Authorization:'Bearer '+token,'Content-Type':'application/json'},body:'{}'});
-  const first=send(),second=send();
+  // Dedicated sockets exercise the server limit rather than fetch's connection pool.
+  const send=()=>new Promise((resolve,reject)=>{
+    const req=httpRequest(url+'/v1/jobs',{method:'POST',agent:false,headers:{Authorization:'Bearer '+token,'Content-Type':'application/json'}},res=>{
+      res.resume();res.once('end',()=>resolve({status:res.statusCode}));
+    });
+    req.once('error',reject);req.end('{}');
+  });
+  const pending=[];
   try {
-    await both;
+    // Admit one connection at a time, keeping every accepted request pending.
+    // Bursting 200 TCP connects tests the OS accept backlog instead of our cap.
+    for(let i=0;i<limit;i++) {
+      let rejected;
+      const admitted=new Promise((resolve,reject)=>{entered=resolve;rejected=reject;});
+      const request=send();request.catch(rejected);pending.push(request);
+      await admitted;
+    }
+    assert.equal(count,limit);
     assert.equal((await fetch(url+'/healthz',{headers:{Authorization:'Bearer '+token}})).status,200);
     assert.equal((await send()).status,429);
-  } finally {unblock();await Promise.all([first,second]);}
+    unblock();
+    assert.ok((await Promise.all(pending)).every(r=>r.status===202));
+  } finally {unblock();await Promise.allSettled(pending);}
 });
 
 test('reference admission aborts during DNS without holding the queue indefinitely',async()=>{
@@ -429,4 +512,29 @@ test('an upload-rejected queued job cannot starve a healthy leased request',asyn
   await bridge.tick();await bridge.tick();await bridge.tick();
   assert.equal(bridge.get(healthy.id).status,'in_progress');
   assert.equal(bridge.get(blocked.id).status,'queued');assert.equal(paid,1);assert.ok(uploads>=1);
+});
+
+test('terminal upstream failures preserve original codes and messages without private payloads', async t => {
+  for (const upstream of [
+    {state:'failed',resources:[{state:'failed',resourceId:'r',serviceCode:20100}]},
+    {state:'failed',resources:[{state:'failed',resourceId:'r',serviceCode:20100}],error:{message:'Original upstream rejection'}},
+    {state:'failed',resources:[{state:'failed',resourceId:'r',serviceCode:20100,errorMessage:'内容不符合平台规则，请修改后重试',privateUrl:'https://secret'}]},
+    {state:'failed',error:{code:'ContentRejected',message:'Reference image was rejected',details:{token:'secret'}}},
+  ]) await t.test(JSON.stringify(upstream.error?.code || upstream.resources[0].serviceCode)+' '+Boolean(upstream.resources?.[0].errorMessage), async t => {
+    const {bridge}=await videoFixture(t,async a=>a[0]==='node'?{submission:{state:'accepted'}}:upstream);
+    const j=await bridge.submit({kind:'video',model:'seedance_2.5',prompt:'waves'},'error');
+    await bridge.tick();await bridge.tick();
+    const err=bridge.get(j.id).error;
+    assert.equal(err.code,'generation_failed');
+    assert.equal(err.upstream_code,upstream.error?.code || 20100);
+    assert.equal(err.message,upstream.error?.message || upstream.resources[0].errorMessage || 'Dreamina service error: 20100');
+    assert.equal(JSON.stringify(err).includes('secret'),false);
+  });
+});
+
+test('explicit submission rejection keeps the upstream reason', async t => {
+  const {bridge}=await videoFixture(t,async()=>({submission:{state:'rejected',error:{code:'INPUT_REJECTED',message:'Unsupported reference image'}}}));
+  const j=await bridge.submit({kind:'video',model:'seedance_2.5',prompt:'waves'},'reject');
+  await bridge.tick();
+  assert.deepEqual(bridge.get(j.id).error,{code:'submission_rejected',message:'Unsupported reference image',upstream_code:'INPUT_REJECTED'});
 });

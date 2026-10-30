@@ -13,7 +13,7 @@ export const VIDEO_MODELS = {
 };
 const MAX_INPUT_BYTES = 64 * 1024 * 1024;
 export const meta = {
-  apiVersion: 1, key: 'dreamina-cli', name: 'Dreamina CLI Video', icon: 'text:即梦', version: '0.2.0',
+  apiVersion: 1, key: 'dreamina-cli', name: 'Dreamina CLI Video', icon: 'text:即梦', version: '0.2.1',
   'author': { name: 'JethroCao' },
   'description': { en: 'Video generation through the official Dreamina Canvas CLI', zh: '通过官方即梦画布 CLI 生成视频' },
   'models': Object.keys(VIDEO_MODELS).concat(['dreamina-video']),
@@ -179,6 +179,10 @@ export function buildContentRequest(ctx) {
 export const protocols={openai_video:{decodeRequest:decode,render:function(ctx,task){
   const d=task.data||{}, result={};
   for (const key of ['seconds','n','video_count','resolution','ratio','mode','warning']) if(d[key]!==undefined) result[key]=d[key];
-  if(task.status==='FAILURE') result.error={code:'video_generation_failed',message:task.fail_reason||'Dreamina generation failed'};
+  if(task.status==='FAILURE') {
+    result.error={code:'video_generation_failed',message:task.fail_reason||'Dreamina generation failed'};
+    const upstream=d.error && d.error.upstream_code;
+    if ((Number.isSafeInteger(upstream) && upstream!==0) || (typeof upstream==='string' && /^[A-Za-z0-9_.:-]{1,128}$/.test(upstream))) result.error.upstream_code=upstream;
+  }
   return result;
 }}};

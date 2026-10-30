@@ -5,10 +5,12 @@
   "userId": "YOUR_NUMERIC_USER_ID",
   "space": "personal",
   "projectId": "YOUR_CANVAS_UUID",
+  "canvasTaskLimit": 5,
   "dataDir": "/absolute/path/to/dreamina-bridge-data",
   "host": "127.0.0.1",
   "port": 8787,
   "publicUrl": "http://localhost:8787",
+  "unlimitedCredits": false,
   "models": {
     "seedance_2.5": {
       "kind": "video",
@@ -52,5 +54,7 @@
     }
   },
   "maxConcurrent": 2,
+  "maxAdmissions": 2,
+  "maxQueueWaitSeconds": 1800,
   "maxInputBytes": 67108864
 }

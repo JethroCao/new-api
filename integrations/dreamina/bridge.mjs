@@ -5,7 +5,9 @@ import { mkdir, open, readFile, readdir, rename, unlink, stat } from 'node:fs/pr
 import { createReadStream } from 'node:fs';
 import { VIDEO_MODELS, normalizeVideo } from './plugin.js';
 import { readReference } from './media-input.mjs';
-import { isAbsolute, join, resolve } from 'node:path';
+import { isAbsolute, join } from 'node:path';
+import { atomicJSON } from './state-file.mjs';
+import { CanvasPool } from './canvas-pool.mjs';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const ID = /^[A-Za-z0-9_-]{1,160}$/;
@@ -21,7 +23,9 @@ function equal(a, b) {
 export function validateConfig(input) {
   const c = { host: '127.0.0.1', port: 8787, profile: 'default', region: 'cn',
     pollMs: 5000, commandTimeoutMs: 120000, maxQueue: 20, maxJobs: 1000,
-    maxConcurrent: 2, maxInputBytes: 64 * 1024 * 1024, maxMediaBytes: 512 * 1024 * 1024, mediaTTL: 3600, maxQueueWaitSeconds: 300, leaseSeconds: 15, ...input };
+    maxConcurrent: 2, maxAdmissions: 2, maxInputBytes: 64 * 1024 * 1024, maxMediaBytes: 512 * 1024 * 1024, mediaTTL: 3600, maxQueueWaitSeconds: 1800, leaseSeconds: 15, unlimitedCredits: false, canvasTaskLimit: 0, ...input };
+  if (![0,5].includes(c.canvasTaskLimit)) fail('invalid config canvasTaskLimit (0 or 5)');
+  if (typeof c.unlimitedCredits !== 'boolean') fail('invalid config unlimitedCredits');
   if (typeof c.token !== 'string' || c.token.length < 32 || /\s/.test(c.token)) fail('config token must have at least 32 non-whitespace characters');
   if (!UUID.test(c.projectId) || !/^\d+$/.test(c.userId || '')) fail('config projectId and userId are required');
   if (c.space !== 'personal' && !/^team:\d+$/.test(c.space || '')) fail('config space must be personal or team:<id>');
@@ -32,8 +36,8 @@ export function validateConfig(input) {
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash || url.pathname !== '/') fail('invalid config publicUrl');
   c.publicUrl = url.origin;
   for (const [key, min, max] of [['port', 1, 65535], ['pollMs', 1000, 60000], ['commandTimeoutMs', 1000, 600000],
-    ['maxQueue', 1, 100], ['maxConcurrent', 1, 8], ['maxInputBytes', 1, 64 * 1024 * 1024], ['maxJobs', 1, 100000], ['maxMediaBytes', 1, 1073741824], ['mediaTTL', 60, 86400],
-    ['maxQueueWaitSeconds', 1, 600], ['leaseSeconds', 1, 15]]) {
+    ['maxQueue', 1, 200], ['maxConcurrent', 1, 200], ['maxAdmissions', 1, 200], ['maxInputBytes', 1, 64 * 1024 * 1024], ['maxJobs', 1, 100000], ['maxMediaBytes', 1, 1073741824], ['mediaTTL', 60, 86400],
+    ['maxQueueWaitSeconds', 1, 1800], ['leaseSeconds', 1, 15]]) {
     if (!integer(c[key], min, max)) fail('invalid config ' + key);
   }
   if (!c.models || Array.isArray(c.models) || !Object.keys(c.models).length) fail('config models are required');
@@ -49,6 +53,26 @@ export function validateConfig(input) {
     if (!Array.isArray(values) || !values.length || values.some(v => !integer(v, 1, max)) || !values.includes(m.kind === 'image' ? 1 : 5)) fail('invalid config counts/durations: ' + alias);
   }
   return c;
+}
+
+// Select public error fields only. Never persist the entire upstream envelope.
+function upstreamError(sources) {
+  const result = {};
+  for (const source of sources) {
+    if (!source || typeof source !== 'object') continue;
+    for (const candidate of [source.error, source]) {
+      if (!candidate || typeof candidate !== 'object') continue;
+      const rawCode = candidate.serviceCode ?? candidate.errorCode ?? candidate.code;
+      const code = Number.isSafeInteger(rawCode) && rawCode !== 0 ? rawCode
+        : typeof rawCode === 'string' && /^[A-Za-z0-9_.:-]{1,128}$/.test(rawCode) && rawCode !== '0' ? rawCode : undefined;
+      const rawMessage = candidate.errorMessage ?? candidate.serviceMessage ?? candidate.message;
+      const message = typeof rawMessage === 'string' && rawMessage.trim() ? rawMessage.slice(0, 4096) : undefined;
+      if (result.code === undefined && code !== undefined) result.code = code;
+      if (result.message === undefined && message !== undefined) result.message = message;
+      if (result.code !== undefined && result.message !== undefined) return result;
+    }
+  }
+  return result;
 }
 
 // argv is passed without a shell. User text stays one --prompt=<value> argument.
@@ -76,15 +100,6 @@ export function runCLI(executable, args, timeout = 120000) {
       resolvePromise(result.data);
     });
   });
-}
-
-async function atomicJSON(path, value) {
-  const tmp = path + '.' + randomUUID() + '.tmp';
-  const file = await open(tmp, 'wx', 0o600);
-  try { await file.writeFile(JSON.stringify(value)); await file.sync(); } finally { await file.close(); }
-  await rename(tmp, path);
-  const directory = await open(resolve(path, '..'), 'r');
-  try { await directory.sync(); } finally { await directory.close(); }
 }
 
 function mediaType(bytes, kind) {
@@ -115,6 +130,8 @@ export class Bridge {
         bridge.jobs.set(job.id, job);
         bridge.keys.set(job.key, job.id);
       }
+      bridge.canvases = await CanvasPool.open({path:join(config.dataDir,'canvases.json'),context:bridge.contextKey,
+        legacyProjectId:config.projectId,jobs:[...bridge.jobs.values()]});
       return bridge;
     } catch (error) { await bridge.close(); throw error; }
   }
@@ -254,6 +271,22 @@ export class Bridge {
           job.inputs.push({resourceId,filename,type:ref.type,sha256:hash(media.bytes),uploaded:false});
         }
         if (request.references) request.references = job.inputs.map(input => ({type:input.type}));
+        const reserved = this.canvases.lookup(job);
+        if (reserved) {
+          job.projectId = reserved.projectId;
+          job.canvasName = reserved.name;
+        } else if (this.config.canvasTaskLimit === 5) {
+          const source = request.mode === 'promote' ? this.jobs.get(request.source_job_id) : undefined;
+          const canvas = await this.canvases.reserve(job, source ? this.projectId(source) : undefined);
+          job.projectId = canvas.projectId;
+          job.canvasName = canvas.name;
+        } else {
+          // Fixed mode only affects new independent jobs. Source-bound work
+          // must keep its project even when rotation has been switched off.
+          const source = request.mode === 'promote' ? this.jobs.get(request.source_job_id) : undefined;
+          job.projectId = source ? this.projectId(source) : this.config.projectId;
+          if (job.projectId !== this.config.projectId) await this.canvases.reserve(job, job.projectId);
+        }
         await this.save(job);
       } catch(e) {
         for (const input of job.inputs) await unlink(join(this.config.dataDir,input.filename)).catch(()=>{});
@@ -268,6 +301,8 @@ export class Bridge {
   }
 
   async save(job) { await atomicJSON(join(this.config.dataDir, job.id + '.json'), job); }
+
+  projectId(job) { return job.projectId || this.config.projectId; }
 
   get(id) {
     const j = this.jobs.get(id);
@@ -339,6 +374,13 @@ export class Bridge {
         this.failed(job, 'queue_expired'); await this.save(job); return;
       }
       if (!(this.leases.get(job.id) > Date.now())) { job.attention = 'awaiting_gateway'; await this.save(job); return; }
+      try {
+        await this.canvases.ensureCreated(this.projectId(job), canvas =>
+          this.cli(['canvas','create',canvas.name,'--project-id='+canvas.projectId]));
+      } catch { job.attention='canvas_creation_pending';await this.save(job);return; }
+      if (Date.now() >= (job.created_at+this.config.maxQueueWaitSeconds)*1000 || !(this.leases.get(job.id)>Date.now())) {
+        job.attention='awaiting_gateway';await this.save(job);return;
+      }
       if (Object.hasOwn(VIDEO_MODELS, job.request.model)) {
         try {
           const list = await this.cli(['model','list','--type=video']);
@@ -359,7 +401,7 @@ export class Bridge {
             if(input.uploaded) continue;
             const path=join(this.config.dataDir,input.filename);
             if(hash(await readFile(path))!==input.sha256) fail('input checksum mismatch');
-            const result=await this.cli(['resource','upload','--file='+path,'--type='+input.type,'--project-id='+this.config.projectId,'--resource-id='+input.resourceId]);
+            const result=await this.cli(['resource','upload','--file='+path,'--type='+input.type,'--project-id='+this.projectId(job),'--resource-id='+input.resourceId]);
             if(result.resourceId!==input.resourceId || result.mediaType!==input.type) fail('input upload mismatch');
             input.uploaded=true; await this.save(job);
           }
@@ -376,23 +418,26 @@ export class Bridge {
       await this.save(job);
       const r = job.request, m = this.config.models[r.model];
       const video = Object.hasOwn(VIDEO_MODELS, r.model);
-      const args = r.mode === 'promote' ? ['node','promote','video-sample','--project-id='+this.config.projectId,
+      // Only the operator can approve uncapped spending. Client payloads cannot
+      // override this policy; the gateway still reserves user quota first.
+      const creditApproval = this.config.unlimitedCredits ? '--yes' : '--credit-ceiling=' + m.maxCredits;
+      const args = r.mode === 'promote' ? ['node','promote','video-sample','--project-id='+this.projectId(job),
         '--node-id='+this.jobs.get(r.source_job_id).nodeId,'--submit-id='+job.submitId,'--resolution='+r.resolution,
-        '--title=Video promotion','--credit-ceiling='+m.maxCredits] :
-        ['node', 'create', r.kind, '--project-id=' + this.config.projectId,
+        '--title=Video promotion',creditApproval] :
+        ['node', 'create', r.kind, '--project-id=' + this.projectId(job),
         '--node-id=' + job.nodeId, '--update-id=' + job.updateId, '--submit-id=' + job.submitId,
         '--mode=' + (video ? r.mode : r.kind === 'image' ? 't2i' : 't2v'), '--model=' + m.model,
         '--prompt=' + r.prompt, '--ratio=' + (video ? r.ratio : m.ratio), '--resolution=' + (video ? r.resolution : m.resolution),
         '--count='+r.n, ...(r.kind === 'video' ? ['--duration=' + r.seconds] : []),
         ...(video ? ['--title=Video generation', ...(job.inputs || []).map(input=>'--ref=res:'+input.resourceId)] : []),
-        '--credit-ceiling=' + m.maxCredits, '--run'];
+        creditApproval, '--run'];
       try {
         const result = await this.cli(args);
         if (r.mode === 'promote') {
           if (result.submitId !== job.submitId) job.attention = 'submission_uncertain';
-          else if (String(result.state).toLowerCase() === 'rejected') this.failed(job,'submission_rejected');
+          else if (String(result.state).toLowerCase() === 'rejected') this.failed(job,'submission_rejected', result);
           else if (!['accepted','completed','in_progress'].includes(String(result.state).toLowerCase())) job.attention='submission_uncertain';
-        } else if (String(result.submission?.state).toLowerCase() === 'rejected') this.failed(job, 'submission_rejected');
+        } else if (String(result.submission?.state).toLowerCase() === 'rejected') this.failed(job, 'submission_rejected', result.submission, result);
         else if (!result.submission || result.submission.submitId && result.submission.submitId !== job.submitId) job.attention = 'submission_uncertain';
       } catch (error) {
         // Exit 10 is documented as quotation awaiting approval, without debit.
@@ -402,7 +447,7 @@ export class Bridge {
       await this.save(job); return;
     }
     let operation;
-    try { operation = await this.cli(['operation', 'status', job.submitId, '--project-id=' + this.config.projectId]); }
+    try { operation = await this.cli(['operation', 'status', job.submitId, '--project-id=' + this.projectId(job)]); }
     catch { job.attention = 'status_unavailable'; await this.save(job); return; }
     if (operation.operationRef && operation.operationRef !== job.submitId) {
       job.attention = 'operation_mismatch'; await this.save(job); return;
@@ -411,7 +456,7 @@ export class Bridge {
     const state = String(operation.state).toLowerCase();
     const submission = String(operation.submission?.state).toLowerCase();
     if (!resources.length && (submission === 'rejected' || state === 'failed')) {
-      this.failed(job, 'generation_failed'); await this.save(job); return;
+      this.failed(job, 'generation_failed', ...resources.filter(r => r.state === 'failed'), operation.submission, operation); await this.save(job); return;
     }
     if (!resources.length || resources.some(r => !['succeeded', 'failed'].includes(r.state))) {
       if (['absent', 'unknown', 'awaiting_confirmation'].includes(submission) || state === 'unknown') job.attention = 'manual_recovery_required';
@@ -422,7 +467,7 @@ export class Bridge {
       job.attention = 'resource_count_mismatch'; await this.save(job); return;
     }
     const successful = resources.filter(r => r.state === 'succeeded');
-    if (!successful.length) { this.failed(job, 'generation_failed'); await this.save(job); return; }
+    if (!successful.length) { this.failed(job, 'generation_failed', ...resources.filter(r => r.state === 'failed'), operation.submission, operation); await this.save(job); return; }
     try {
       for (let i = 0; i < successful.length; i++) {
         const resourceId = successful[i].resourceId;
@@ -436,13 +481,22 @@ export class Bridge {
     await this.save(job);
   }
 
-  failed(job, code) { job.status = 'failed'; job.error = { code, message: code.replaceAll('_', ' ') }; }
+  failed(job, code, ...sources) {
+    const upstream = upstreamError(sources);
+    let message = upstream.message || (upstream.code !== undefined ? 'Dreamina service error: ' + upstream.code : code.replaceAll('_', ' '));
+    // Public error text is retained; known credentials are never echoed.
+    message = message.replaceAll(this.config.token, '[redacted]')
+      .replace(/Bearer\s+[A-Za-z0-9._~+\/-]+=*/gi, 'Bearer [redacted]')
+      .replace(/((?:access_token|refresh_token|api_key|token|signature|X-Tos-Signature)=)[^\s&]+/gi, '$1[redacted]');
+    job.status = 'failed';
+    job.error = {code, message, ...(upstream.code !== undefined ? {upstream_code: upstream.code} : {})};
+  }
 
   async download(job, resourceId, index) {
     const filename = job.id + '-' + index + '.bin';
     const partial = join(this.config.dataDir, filename + '.part');
     await unlink(partial).catch(e => { if (e.code !== 'ENOENT') throw e; });
-    const result = await this.cli(['resource', 'download', resourceId, '--project-id=' + this.config.projectId, '--output=' + partial]);
+    const result = await this.cli(['resource', 'download', resourceId, '--project-id=' + this.projectId(job), '--output=' + partial]);
     const info = await stat(partial);
     if (!info.isFile() || !info.size || info.size > this.config.maxMediaBytes || result.path !== partial || result.size !== info.size) fail('invalid download');
     const file = await open(partial, 'r');
@@ -503,7 +557,7 @@ export function createServer(bridge) {
       if (req.method === 'GET' && url.pathname === '/healthz') return json(res, 200, { status: 'ok', queued: [...bridge.jobs.values()].filter(j => !terminal(j)).length });
       if (req.method === 'POST' && url.pathname === '/v1/jobs') {
         if ((req.headers['content-type'] || '').split(';')[0].trim() !== 'application/json') fail('JSON required', 415);
-        if (admissions >= 2) fail('submission admission capacity reached', 429);
+        if (admissions >= bridge.config.maxAdmissions) fail('submission admission capacity reached', 429);
         admissions++;
         try {
           const chunks = []; let size = 0;
