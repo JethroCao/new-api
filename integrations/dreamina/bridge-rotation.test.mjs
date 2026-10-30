@@ -59,6 +59,7 @@ test('uploads generation status and downloads use the bound canvas after restart
   const restored=await Bridge.open(cfg,cli);t.after(()=>restored.close());await restored.preflight();
   restored.observe(result.id);await restored.processJob(restored.jobs.get(result.id));
   restored.observe(result.id);await restored.processJob(restored.jobs.get(result.id));
+  await restored.processJob(restored.jobs.get(result.id)); // Independent download phase.
   assert.equal(restored.get(result.id).status,'completed');
   const work=calls.filter(a=>['canvas','resource','node','operation'].includes(a[0]));
   assert.deepEqual(work.map(a=>a.slice(0,2).join(' ')),['canvas create','resource upload','node create','operation status','resource download']);
@@ -72,6 +73,7 @@ test('legacy in-progress jobs keep their original canvas when rotation is enable
   await bridge.close();calls.length=0;
   const restored=await Bridge.open({...cfg,canvasTaskLimit:5},cli);t.after(()=>restored.close());await restored.preflight();
   await restored.processJob(restored.jobs.get(result.id));
+  await restored.processJob(restored.jobs.get(result.id)); // Independent download phase.
   assert.equal(restored.get(result.id).status,'completed');
   assert.ok(calls.filter(a=>['operation','resource'].includes(a[0])).every(a=>flag(a,'project-id')===legacy));
   assert.equal(calls.some(a=>a[0]==='canvas'),false);

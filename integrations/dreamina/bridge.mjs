@@ -22,8 +22,8 @@ function equal(a, b) {
 
 export function validateConfig(input) {
   const c = { host: '127.0.0.1', port: 8787, profile: 'default', region: 'cn',
-    pollMs: 5000, commandTimeoutMs: 120000, maxQueue: 20, maxJobs: 1000,
-    maxConcurrent: 2, maxAdmissions: 2, maxInputBytes: 64 * 1024 * 1024, maxMediaBytes: 512 * 1024 * 1024, mediaTTL: 3600, maxQueueWaitSeconds: 1800, leaseSeconds: 300, submitWorkers: 6, pollWorkers: 2, unlimitedCredits: false, canvasTaskLimit: 0, ...input };
+    pollMs: 1000, pollIntervalMs: 5000, catalogTTLms: 60000, commandTimeoutMs: 120000, maxQueue: 20, maxJobs: 1000,
+    maxConcurrent: 2, maxAdmissions: 2, maxInputBytes: 64 * 1024 * 1024, maxMediaBytes: 512 * 1024 * 1024, mediaTTL: 3600, maxQueueWaitSeconds: 1800, leaseSeconds: 300, submitWorkers: 6, pollWorkers: 4, downloadWorkers: 2, unlimitedCredits: false, canvasTaskLimit: 0, ...input };
   if (![0,5].includes(c.canvasTaskLimit)) fail('invalid config canvasTaskLimit (0 or 5)');
   if (typeof c.unlimitedCredits !== 'boolean') fail('invalid config unlimitedCredits');
   if (typeof c.token !== 'string' || c.token.length < 32 || /\s/.test(c.token)) fail('config token must have at least 32 non-whitespace characters');
@@ -37,7 +37,7 @@ export function validateConfig(input) {
   c.publicUrl = url.origin;
   for (const [key, min, max] of [['port', 1, 65535], ['pollMs', 1000, 60000], ['commandTimeoutMs', 1000, 600000],
     ['maxQueue', 1, 200], ['maxConcurrent', 1, 200], ['maxAdmissions', 1, 200], ['maxInputBytes', 1, 64 * 1024 * 1024], ['maxJobs', 1, 100000], ['maxMediaBytes', 1, 1073741824], ['mediaTTL', 60, 86400],
-    ['maxQueueWaitSeconds', 1, 1800], ['leaseSeconds', 1, 300], ['submitWorkers', 1, 6], ['pollWorkers', 1, 2]]) {
+    ['maxQueueWaitSeconds', 1, 1800], ['leaseSeconds', 1, 300], ['submitWorkers', 1, 6], ['pollWorkers', 1, 8], ['downloadWorkers', 1, 4], ['pollIntervalMs', 1000, 60000], ['catalogTTLms', 1000, 60000]]) {
     if (!integer(c[key], min, max)) fail('invalid config ' + key);
   }
   if (!c.models || Array.isArray(c.models) || !Object.keys(c.models).length) fail('config models are required');
@@ -141,7 +141,9 @@ export class Bridge {
     this.cli = cli || (args => runCLI(config.cli, ['--format=json', '--non-interactive', '--profile=' + config.profile, '--region=' + config.region, ...args], config.commandTimeoutMs));
     this.contextKey = hash(JSON.stringify([config.profile, config.region, config.userId, config.space, config.projectId, config.models]));
     this.jobs = new Map(); this.keys = new Map(); this.admissions = Promise.resolve();
-    this.lastQueuedId = null; this.lastPolledId = null;
+    this.lastQueuedId = null; this.lastPolledId = null; this.lastDownloadedId = null;
+    this.nextPoll = new Map(); this.nextDownload = new Map();
+    this.catalogCheckedAt = null; this.catalogRefresh = null; this.contextCheck = null;
     this.inFlight = new Map();
     this.promptLimits = new Map();
     this.videoCatalog = new Map();
@@ -157,9 +159,36 @@ export class Bridge {
   }
 
   async checkContext() {
-    const s = await this.cli(['space', 'current']);
-    const space = s.kind === 'personal' ? 'personal' : s.kind === 'team' ? 'team:' + s.team?.teamId : '';
-    if (s.userId !== this.config.userId || space !== this.config.space) fail('context_mismatch', 503);
+    // Share only simultaneous checks. Never cache successful identity checks:
+    // a later workflow must detect account/space drift before a paid mutation.
+    if (!this.contextCheck) {
+      this.contextCheck = (async () => {
+        const s = await this.cli(['space', 'current']);
+        const space = s.kind === 'personal' ? 'personal' : s.kind === 'team' ? 'team:' + s.team?.teamId : '';
+        if (s.userId !== this.config.userId || space !== this.config.space) fail('context_mismatch', 503);
+      })().finally(() => { this.contextCheck = null; });
+    }
+    await this.contextCheck;
+  }
+
+  async refreshVideoCatalog() {
+    if (this.catalogCheckedAt !== null && Date.now() - this.catalogCheckedAt < this.config.catalogTTLms) return;
+    if (!this.catalogRefresh) {
+      this.catalogRefresh = (async () => {
+        const list = await this.cli(['model', 'list', '--type=video']);
+        if (!Array.isArray(list.items) || !list.items.length) fail('live model unavailable');
+        this.videoCatalog = new Map(list.items.map(m => [m.model, m]));
+        this.catalogCheckedAt = Date.now();
+      })().finally(() => { this.catalogRefresh = null; });
+    }
+    await this.catalogRefresh;
+  }
+
+  recordTime(job, phase) {
+    job.timings ||= {};
+    if (job.timings[phase] !== undefined) return;
+    job.timings[phase] = Date.now();
+    this.onEvent?.({event:'dreamina_phase',job_id:job.id,phase,at_ms:job.timings[phase]});
   }
 
   async preflight() {
@@ -187,6 +216,7 @@ export class Bridge {
       if (!integer(max, 1, 100000)) fail('model prompt limit unavailable: ' + alias, 503);
       this.promptLimits.set(alias, Math.min(2000, max));
     }
+    if (catalogues.has('video')) this.catalogCheckedAt = Date.now();
   }
 
   validateLiveVideo(request) {
@@ -257,7 +287,7 @@ export class Bridge {
       if (this.jobs.size >= this.config.maxJobs || [...this.jobs.values()].filter(j => !terminal(j)).reduce((n,j) => n + j.request.n, 0) + request.n > this.config.maxQueue) fail('queue/storage capacity reached', 429);
       const job = { id: randomUUID(), key: keyHash, digest, context: this.contextKey, request,
         nodeId: 'node_' + Array.from(randomBytes(10), b => '0123456789abcdefghjkmnpqrstvwxyz'[b & 31]).join(''), updateId: randomUUID(), submitId: randomUUID(),
-        status: 'queued', created_at: Math.floor(Date.now() / 1000), files: [], inputs: [] };
+        status: 'queued', created_at: Math.floor(Date.now() / 1000), timings: {admitted_at_ms: Date.now()}, files: [], inputs: [] };
       // Only local file identities/hashes are persisted. In particular, signed
       // input URLs and base64 payloads never enter job snapshots or responses.
       try {
@@ -316,6 +346,8 @@ export class Bridge {
       reference_video:(j.request.references || []).some(r=>r.type==='video'),
       ...(j.request.model === 'seedance_2.5_draft' ? {warning:'样片最长存储 7 天，过期后不可再生成正片；具体期限以即梦服务端为准'} : {}),
       seconds: j.request.seconds, image_count: j.status === 'completed' ? j.files.length : j.request.n,
+      timings: j.timings ? {...j.timings} : undefined,
+      phase: terminal(j) ? j.status : j.downloadResources ? 'downloading' : j.status,
       progress: j.status === 'completed' ? 100 : 0, attention: j.attention, error: j.error,
       data: j.status === 'completed' && j.request.kind === 'image' ? j.files.map((f, i) => ({ url: this.mediaURL(j.id, i) })) : [] };
   }
@@ -342,16 +374,19 @@ export class Bridge {
     // asynchronous work. Overlapping timer ticks cannot dispatch a job twice.
     let occupied = [...this.jobs.values()].reduce((n,j) => n +
       (j.status === 'in_progress' || j.status === 'queued' && this.inFlight.has(j.id) ? j.request.n : 0), 0);
-    for (const lane of ['poll', 'submit']) {
+    for (const lane of ['download', 'poll', 'submit']) {
       const workers = [...this.inFlight.values()].filter(w => w.lane === lane);
-      let available = this.config[lane === 'poll' ? 'pollWorkers' : 'submitWorkers'] - workers.length;
+      let available = this.config[lane + 'Workers'] - workers.length;
       const busyCanvases = new Set(workers.map(w => w.projectId));
-      const candidates = [...this.jobs.values()].filter(j => j.status === (lane === 'poll' ? 'in_progress' : 'queued'));
-      const cursor = lane === 'poll' ? 'lastPolledId' : 'lastQueuedId';
+      const candidates = [...this.jobs.values()].filter(j => lane === 'submit' ? j.status === 'queued' :
+        j.status === 'in_progress' && (lane === 'download' ? !!j.downloadResources : !j.downloadResources));
+      const cursor = lane === 'poll' ? 'lastPolledId' : lane === 'download' ? 'lastDownloadedId' : 'lastQueuedId';
       const previous = candidates.findIndex(j => j.id === this[cursor]);
       for (let offset = 1; offset <= candidates.length && available > 0; offset++) {
         const job = candidates[(previous + offset) % candidates.length];
         if (this.inFlight.has(job.id)) continue;
+        if (lane === 'poll' && Date.now() < (this.nextPoll.get(job.id) || 0)) continue;
+        if (lane === 'download' && Date.now() < (this.nextDownload.get(job.id) || 0)) continue;
         const expired = job.status === 'queued' && Date.now() >= (job.created_at + this.config.maxQueueWaitSeconds) * 1000;
         const projectId = this.projectId(job);
         if (lane === 'submit' && !expired) {
@@ -368,7 +403,11 @@ export class Bridge {
         }).catch(error => {
           this.schedulerError = error;
           throw error;
-        }).finally(() => { this.inFlight.delete(job.id); });
+        }).finally(() => {
+          if (lane === 'poll') this.nextPoll.set(job.id, Date.now() + this.config.pollIntervalMs);
+          if (lane === 'download') this.nextDownload.set(job.id, Date.now() + this.config.pollIntervalMs);
+          this.inFlight.delete(job.id);
+        });
         pending.push(work.promise);
       }
     }
@@ -376,13 +415,17 @@ export class Bridge {
   }
 
   async processJob(job) {
+    if (terminal(job)) return;
+    if (job.status === 'queued') this.recordTime(job, 'preparation_started_at_ms');
     try { await this.checkContext(); } catch (error) {
       job.attention = error.message === 'context_mismatch' ? 'context_mismatch' : 'cli_unavailable';
       await this.save(job); return;
     }
     if (this.closed) return;
     delete job.attention;
+    if (job.downloadResources) return this.downloadJob(job);
     if (job.status === 'queued') {
+      this.recordTime(job, 'context_checked_at_ms');
       // A context check may itself take a long time. Re-check the start window
       // immediately before any command that can authorize a charge.
       if (Date.now() >= (job.created_at + this.config.maxQueueWaitSeconds) * 1000) {
@@ -393,16 +436,14 @@ export class Bridge {
         await this.canvases.ensureCreated(this.projectId(job), canvas =>
           this.cli(['canvas','create',canvas.name,'--project-id='+canvas.projectId]));
       } catch { job.attention='canvas_creation_pending';await this.save(job);return; }
+      this.recordTime(job, 'canvas_ready_at_ms');
       if (this.closed) return;
       if (Date.now() >= (job.created_at+this.config.maxQueueWaitSeconds)*1000 || !(this.leases.get(job.id)>Date.now())) {
         job.attention='awaiting_gateway';await this.save(job);return;
       }
       if (Object.hasOwn(VIDEO_MODELS, job.request.model)) {
         try {
-          const list = await this.cli(['model','list','--type=video']);
-          const spec = list.items?.find(m => m.model===job.request.model);
-          if (!spec) fail('live model unavailable');
-          this.videoCatalog.set(job.request.model,spec);
+          await this.refreshVideoCatalog();
           this.validateLiveVideo(job.request);
           if (job.request.mode === 'promote') {
             const details = await this.cli(['model','seedance_2.5_draft']);
@@ -412,6 +453,7 @@ export class Bridge {
             if (!values?.includes(job.request.resolution)) fail('promotion resolution unavailable');
           }
         } catch { job.attention='model_unavailable'; await this.save(job); return; }
+        this.recordTime(job, 'model_checked_at_ms');
         try {
           for (const input of job.inputs || []) {
             if (this.closed) return;
@@ -423,6 +465,7 @@ export class Bridge {
             input.uploaded=true; await this.save(job);
           }
         } catch { job.attention='reference_upload_pending'; await this.save(job); return; }
+        this.recordTime(job, 'references_ready_at_ms');
         // Preparation can take longer than the lease. Never generate for a
         // gateway that abandoned a request while it was downloading/uploading.
         if (Date.now() >= (job.created_at+this.config.maxQueueWaitSeconds)*1000 || !(this.leases.get(job.id)>Date.now())) {
@@ -433,6 +476,7 @@ export class Bridge {
       // Durable transition BEFORE any remote mutation. A crash from here on
       // only permits read-only recovery of this exact submit identity.
       job.status = 'in_progress';
+      this.recordTime(job, 'submit_started_at_ms');
       await this.save(job);
       const r = job.request, m = this.config.models[r.model];
       const video = Object.hasOwn(VIDEO_MODELS, r.model);
@@ -457,6 +501,8 @@ export class Bridge {
           else if (!['accepted','completed','in_progress'].includes(String(result.state).toLowerCase())) job.attention='submission_uncertain';
         } else if (String(result.submission?.state).toLowerCase() === 'rejected') this.failed(job, 'submission_rejected', result.submission, result);
         else if (!result.submission || result.submission.submitId && result.submission.submitId !== job.submitId) job.attention = 'submission_uncertain';
+        const accepted = r.mode === 'promote' ? result.state : result.submission?.state;
+        if (!job.attention && job.status === 'in_progress' && ['accepted','completed','in_progress'].includes(String(accepted).toLowerCase())) this.recordTime(job, 'accepted_at_ms');
       } catch (error) {
         // Exit 10 is documented as quotation awaiting approval, without debit.
         if (error.exitCode === 10) this.failed(job, 'credit_approval_required');
@@ -464,12 +510,25 @@ export class Bridge {
       }
       await this.save(job); return;
     }
+    job.timings ||= {};
+    const polledAt = Date.now();
+    if (job.timings.last_poll_started_at_ms !== undefined) job.timings.max_poll_gap_ms = Math.max(job.timings.max_poll_gap_ms || 0, polledAt - job.timings.last_poll_started_at_ms);
+    job.timings.last_poll_started_at_ms = polledAt;
+    job.timings.poll_count = (job.timings.poll_count || 0) + 1;
     let operation;
     try { operation = await this.cli(['operation', 'status', job.submitId, '--project-id=' + this.projectId(job)]); }
-    catch { job.attention = 'status_unavailable'; await this.save(job); return; }
+    catch {
+      job.timings.last_poll_finished_at_ms = Date.now();
+      job.timings.poll_error_count = (job.timings.poll_error_count || 0) + 1;
+      this.onEvent?.({event:'dreamina_poll',job_id:job.id,at_ms:Date.now(),duration_ms:Date.now()-polledAt,state:'status_unavailable',poll_count:job.timings.poll_count});
+      job.attention = 'status_unavailable'; await this.save(job); return;
+    }
+    job.timings.last_poll_finished_at_ms = Date.now();
+    this.onEvent?.({event:'dreamina_poll',job_id:job.id,at_ms:Date.now(),duration_ms:Date.now()-polledAt,state:String(operation.state).slice(0,40),poll_count:job.timings.poll_count});
     if (operation.operationRef && operation.operationRef !== job.submitId) {
       job.attention = 'operation_mismatch'; await this.save(job); return;
     }
+    if (String(operation.submission?.state).toLowerCase() === 'accepted' && job.timings.accepted_at_ms === undefined) this.recordTime(job, 'accepted_observed_at_ms');
     const resources = operation.resources || [];
     const state = String(operation.state).toLowerCase();
     const submission = String(operation.submission?.state).toLowerCase();
@@ -486,16 +545,28 @@ export class Bridge {
     }
     const successful = resources.filter(r => r.state === 'succeeded');
     if (!successful.length) { this.failed(job, 'generation_failed', ...resources.filter(r => r.state === 'failed'), operation.submission, operation); await this.save(job); return; }
+    // Persist the successful resource IDs before releasing the poll worker.
+    // Restart resumes downloads only; never resubmit or wait for another query.
+    if (successful.some(r => !ID.test(r.resourceId))) { job.attention='invalid_resource_id';await this.save(job);return; }
+    job.downloadResources = successful.map(r => r.resourceId);
+    this.recordTime(job, 'upstream_completed_observed_at_ms');
+    await this.save(job);
+  }
+
+  async downloadJob(job) {
+    this.recordTime(job, 'download_started_at_ms');
+    await this.save(job);
     try {
-      for (let i = 0; i < successful.length; i++) {
+      for (let i = 0; i < job.downloadResources.length; i++) {
         if (this.closed) return;
-        const resourceId = successful[i].resourceId;
+        const resourceId = job.downloadResources[i];
         if (!ID.test(resourceId)) fail('invalid resource ID');
         if (job.files[i]?.resourceId === resourceId) continue;
         job.files[i] = await this.download(job, resourceId, i);
         await this.save(job);
       }
       job.status = 'completed'; job.completed_at = Math.floor(Date.now() / 1000);
+      this.recordTime(job, 'download_completed_at_ms');
     } catch { job.attention = 'download_failed'; }
     await this.save(job);
   }
@@ -577,7 +648,9 @@ export function createServer(bridge) {
         waiting: [...bridge.jobs.values()].filter(j => j.status === 'queued').length,
         running: [...bridge.jobs.values()].filter(j => j.status === 'in_progress').length,
         submit_workers: [...bridge.inFlight.values()].filter(w => w.lane === 'submit').length,
-        poll_workers: [...bridge.inFlight.values()].filter(w => w.lane === 'poll').length });
+        poll_workers: [...bridge.inFlight.values()].filter(w => w.lane === 'poll').length,
+        download_workers: [...bridge.inFlight.values()].filter(w => w.lane === 'download').length,
+        downloading: [...bridge.jobs.values()].filter(j => j.status === 'in_progress' && j.downloadResources).length });
       if (req.method === 'POST' && url.pathname === '/v1/jobs') {
         if ((req.headers['content-type'] || '').split(';')[0].trim() !== 'application/json') fail('JSON required', 415);
         if (admissions >= bridge.config.maxAdmissions) fail('submission admission capacity reached', 429);

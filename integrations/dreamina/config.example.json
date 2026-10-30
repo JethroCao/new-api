@@ -59,6 +59,10 @@
   "maxInputBytes": 67108864,
   "maxQueue": 100,
   "submitWorkers": 6,
-  "pollWorkers": 2,
-  "leaseSeconds": 300
+  "pollWorkers": 4,
+  "leaseSeconds": 300,
+  "downloadWorkers": 2,
+  "pollMs": 1000,
+  "pollIntervalMs": 5000,
+  "catalogTTLms": 60000
 }

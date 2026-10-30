@@ -133,12 +133,24 @@ dreamina-canvas --profile new-api --format json model list --type video
 示例配置允许最多 100 个未完成视频（`maxQueue: 100`），其中最多 100 个处于准备或生成阶段（`maxConcurrent: 100`）；批量请求按 `n` 占容量。100 个单视频请求分配到 20 个画布，容量不足返回 429。
 
 - `submitWorkers: 6`：最多 6 条创建画布、上传参考素材、提交生成的工作流并行执行。
-- `pollWorkers: 2`：另有 2 条查询及下载工作流，不被慢上传或提交占用。合计最多 8 个 CLI 命令同时运行；每条工作流内部命令依次执行。
+- `pollWorkers: 4`：4 条独立查询工作流。`downloadWorkers: 2`：2 条独立下载工作流，慢下载不占查询名额；加上提交最多 12 条工作流。同一批同时发起的账号检查会合并。
+- `pollMs: 1000`：每秒分配空闲工作位；`pollIntervalMs: 5000`：每条任务查询后至少等待 5 秒再查，任务多时按轮转顺序分配。
+- `catalogTTLms: 60000`：公开模型规格缓存 60 秒，到期刷新失败不使用过期规格提交。账号/空间检查只合并同时进行的调用，不缓存成功结果。
 - 不同画布并行提交，同一画布的写入暂时串行，提交完成即释放该画布写入位，不等待视频生成完成。查询任务按轮转顺序分配，单个慢任务不会阻塞其他空闲工作位；同一任务不会被重叠的调度周期重复执行。
 - `leaseSeconds: 300`：New API 查询任务后有效 5 分钟，覆盖批量任务串行轮询间隔。提交前仍检查有效期与 30 分钟排队期限；服务重启不恢复有效期，必须等待网关重新查询。已提交或结果不确定的任务只查询原提交 ID，不重新生成。
 - 停机时停止调度并等待正在运行的工作流保存状态后释放数据目录锁；文件持久化失败时停止新调度。
 
 这些容量是本服务的上限，不代表即梦团队能同时生成同样数量的视频；即梦自己的排队、积分和审核规则仍生效。
+
+### 耗时诊断与状态同步
+
+桥接响应和任务状态文件中的 `timings` 使用 Unix 毫秒：`admitted_at_ms`、`preparation_started_at_ms`、`context_checked_at_ms`、`canvas_ready_at_ms`、`model_checked_at_ms`、`references_ready_at_ms`、`submit_started_at_ms`、`accepted_at_ms`、`upstream_completed_observed_at_ms`、`download_started_at_ms`、`download_completed_at_ms`。旧任务不补造历史时间；结果不确定后才查到已受理，记录为 `accepted_observed_at_ms`。
+
+`poll_count`、`poll_error_count`、`last_poll_started_at_ms`、`last_poll_finished_at_ms`、`max_poll_gap_ms` 用于判断查询积压。结构化服务日志只记录任务 ID、阶段、时间、状态和查询次数，不记录提示词、素材或凭据。`upstream_completed_observed_at_ms` 是本地观察到上游完成的时间，不是即梦提供的真实完成时间，不能据此单独计算官方排队或生成耗时。
+
+观察到成功资源后先保存资源 ID，再由独立下载队列处理；校验下载内容成功后才返回 `completed`。重启继续下载原资源，不重新生成；部分成功仍只交付成功资源。升级不搬迁已有任务或修改画布名额。
+
+New API 的即梦渠道可开启现有 `other_settings.disable_task_polling_sleep: true`，仅取消查询本机桥接快照时每条任务之间的 1 秒睡眠。保留原有 15 秒系统轮询调度，仍存在一定同步延迟；不应自动对其他直连上游的渠道开启此设置。
 
 `maxCredits` 是**整次任务（含全部 n 个结果）的最高即梦积分报价**，不是每个视频的积分，也不是人民币或 New API 单价。示例全部为 0，不批准正积分消费；管理员须明确设置允许的上限，客户端不能覆盖。它不等于累计预算，仍须设置 New API 令牌额度、限流和价格。
 

@@ -26,6 +26,8 @@ try {
     bridge = await Bridge.open(config);
     bridge.promptLimits = probe.promptLimits;
     bridge.videoCatalog = probe.videoCatalog;
+    bridge.catalogCheckedAt = probe.catalogCheckedAt;
+    bridge.onEvent = event => console.log(JSON.stringify(event));
     server = createServer(bridge);
     await new Promise((done, reject) => { server.once('error', reject); server.listen(config.port, config.host, done); });
     console.log('Dreamina bridge listening on ' + config.host + ':' + config.port);

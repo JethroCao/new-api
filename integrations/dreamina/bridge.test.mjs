@@ -20,6 +20,7 @@ async function fixture(t, cli) {
   const dir = await mkdtemp(join(tmpdir(), 'dreamina-test-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const cfg = config(dir);
+  cfg.pollIntervalMs = 0; // Lifecycle tests advance manually; pacing is covered separately.
   const bridge = await Bridge.open(cfg, cli);
   t.after(() => bridge.close());
   return { bridge, cfg, dir };
@@ -81,6 +82,7 @@ test('submission timeout is recovered by original submit ID and never generates 
   ready = true;
   await recovered.tick();
   assert.equal(queriedID, original);
+  await recovered.tick(); // Independent download dispatch.
   assert.equal(recovered.get(job.id).status, 'completed');
   assert.equal(submitted, 1);
   assert.equal(recovered.get(job.id).data.length, 1);
@@ -112,8 +114,9 @@ test('empty resource collection and unsupported video download never produce suc
   const job = await bridge.submit({ kind: 'video', model: 'dreamina-video', prompt: 'waves', seconds: 5 }, 'video');
   await bridge.tick(); await bridge.tick();
   assert.notEqual(bridge.get(job.id).status, 'completed');
-  empty = false; await bridge.tick();
+  empty = false; await bridge.tick(); await bridge.tick();
   assert.notEqual(bridge.get(job.id).status, 'completed');
+  await bridge.tick();
   assert.equal(bridge.get(job.id).attention, 'download_failed');
 });
 
@@ -138,7 +141,7 @@ test('HTTP auth, signed download expiry/tampering and content ranges', async t =
   const job = await created.json(); await bridge.tick();
   assert.equal(bridge.get(job.id).status, 'queued');
   await fetch(cfg.publicUrl + '/v1/jobs/' + job.id, { headers });
-  await bridge.tick(); await bridge.tick();
+  await bridge.tick(); await bridge.tick(); await bridge.tick();
   const done = await (await fetch(cfg.publicUrl + '/v1/jobs/' + job.id, { headers })).json();
   assert.equal(done.status, 'completed');
   const url = done.data[0].url;
@@ -168,7 +171,7 @@ test('partial image failure delivers and bills only successful artifacts', async
     return { path, size: png.length, sha256: createHash('sha256').update(png).digest('hex') };
   });
   const job = await bridge.submit({ ...request, n: 2 }, 'partial');
-  await bridge.tick(); await bridge.tick();
+  await bridge.tick(); await bridge.tick(); await bridge.tick();
   assert.equal(bridge.get(job.id).status, 'completed');
   assert.equal(bridge.get(job.id).image_count, 1);
   assert.equal(bridge.get(job.id).data.length, 1);
@@ -211,6 +214,7 @@ test('HTML masquerading as generated media is never exposed as a completed artif
   const job = await bridge.submit(request, 'invalid-media');
   await bridge.tick(); await bridge.tick();
   assert.equal(bridge.get(job.id).status, 'in_progress');
+  await bridge.tick();
   assert.equal(bridge.get(job.id).attention, 'download_failed');
   assert.deepEqual(bridge.get(job.id).data, []);
 });
@@ -247,7 +251,7 @@ test('video uses the approved duration and only completes after verified MP4 dow
   assert.ok(submittedArgs.includes('--duration=10'));
   assert.ok(submittedArgs.includes('--credit-ceiling=10'));
   assert.ok(submittedArgs.includes('--mode=t2v'));
-  await bridge.tick();
+  await bridge.tick(); await bridge.tick();
   assert.equal(bridge.get(job.id).status, 'completed');
   assert.equal(bridge.get(job.id).seconds, 10);
   assert.equal(bridge.jobs.get(job.id).files[0].mime, 'video/mp4');
@@ -259,6 +263,7 @@ async function videoFixture(t, handler, overrides = {}) {
   const dir=await mkdtemp(join(tmpdir(),'dreamina-video-'));
   t.after(()=>rm(dir,{recursive:true,force:true}));
   const cfg=validateConfig({...config(dir),maxConcurrent:100,models:Object.fromEntries(liveCatalog.items.map(m=>[m.model,{kind:'video',model:m.model,maxCredits:100}])),...overrides});
+  cfg.pollIntervalMs = 0; // Lifecycle tests advance manually.
   const cli=async args=>{
     if(args[0]==='space') return context;
     if(args[0]==='model' && args[1]==='list') return liveCatalog;
@@ -397,7 +402,7 @@ test('multi-video partial completion counts only verified downloads and exposes 
     return {path,size:mp4.length,sha256:createHash('sha256').update(mp4).digest('hex')};
   });
   const j=await bridge.submit({kind:'video',model:'seedance_2.5',prompt:'x',seconds:10,n:3},'partial-video');
-  await bridge.tick();await bridge.tick();
+  await bridge.tick();await bridge.tick();await bridge.tick();
   assert.equal(bridge.get(j.id).status,'completed');assert.equal(bridge.get(j.id).video_count,2);assert.equal(bridge.get(j.id).n,3);
 });
 
