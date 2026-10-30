@@ -1,0 +1,60 @@
+{
+  "cli": "/absolute/path/to/dreamina-canvas",
+  "profile": "new-api",
+  "region": "cn",
+  "userId": "YOUR_NUMERIC_USER_ID",
+  "space": "personal",
+  "projectId": "YOUR_CANVAS_UUID",
+  "canvasTaskLimit": 5,
+  "dataDir": "/absolute/path/to/dreamina-bridge-data",
+  "host": "127.0.0.1",
+  "port": 8787,
+  "publicUrl": "http://localhost:8787",
+  "unlimitedCredits": false,
+  "models": {
+    "seedance_2.5": {
+      "kind": "video",
+      "model": "seedance_2.5",
+      "maxCredits": 0
+    },
+    "seedance_2.5_draft": {
+      "kind": "video",
+      "model": "seedance_2.5_draft",
+      "maxCredits": 0
+    },
+    "seedance_2.0_vip": {
+      "kind": "video",
+      "model": "seedance_2.0_vip",
+      "maxCredits": 0
+    },
+    "seedance_2.0_fast_vip": {
+      "kind": "video",
+      "model": "seedance_2.0_fast_vip",
+      "maxCredits": 0
+    },
+    "seedance_2.0_mini": {
+      "kind": "video",
+      "model": "seedance_2.0_mini",
+      "maxCredits": 0
+    },
+    "seedance_pro_fast": {
+      "kind": "video",
+      "model": "seedance_pro_fast",
+      "maxCredits": 0
+    },
+    "happyhorse_1.1": {
+      "kind": "video",
+      "model": "happyhorse_1.1",
+      "maxCredits": 0
+    },
+    "wan_3.0": {
+      "kind": "video",
+      "model": "wan_3.0",
+      "maxCredits": 0
+    }
+  },
+  "maxConcurrent": 2,
+  "maxAdmissions": 2,
+  "maxQueueWaitSeconds": 1800,
+  "maxInputBytes": 67108864
+}

@@ -30,6 +30,93 @@ For commercial licensing, please contact support@quantumnous.com
 @import './theme.css';
 @import './theme-presets.css';
 
+/* NEXORA catalog: keep the brand palette local, including portalled drawers. */
+@layer components {
+  .nexora-catalog,
+  .nexora-catalog-overlay {
+    --background: #f7faff;
+    --foreground: #102445;
+    --card: #fff;
+    --card-foreground: #102445;
+    --primary: #1552f5;
+    --primary-foreground: #fff;
+    --secondary: #eaf1ff;
+    --secondary-foreground: #1744b5;
+    --muted: #f0f5fc;
+    --muted-foreground: #61718a;
+    --accent: #eaf1ff;
+    --accent-foreground: #1744b5;
+    --border: #dfe7f1;
+    --input: #d5e1f1;
+    --ring: #1552f5;
+    color: var(--foreground);
+    background: var(--background);
+  }
+
+  .dark .nexora-catalog,
+  .dark .nexora-catalog-overlay {
+    --background: #101d31;
+    --foreground: #e4ecfa;
+    --card: #14243c;
+    --card-foreground: #e4ecfa;
+    --primary: #8bb2ff;
+    --primary-foreground: #101d31;
+    --secondary: #20385b;
+    --secondary-foreground: #bed4ff;
+    --muted: #192e4a;
+    --muted-foreground: #a3b4ce;
+    --accent: #20385b;
+    --accent-foreground: #bed4ff;
+    --border: #2b3d57;
+    --input: #395580;
+    --ring: #8bb2ff;
+  }
+
+  .nexora-catalog-header {
+    border-color: var(--border);
+  }
+
+  .nexora-catalog-search input {
+    height: 3.25rem;
+    border-color: var(--input);
+    border-radius: 0.75rem;
+    background: var(--card);
+    box-shadow: 0 4px 18px -10px rgb(21 82 245 / 18%);
+  }
+
+  .nexora-catalog-search input::placeholder {
+    color: var(--muted-foreground);
+  }
+
+  .nexora-catalog .nexora-model-card {
+    border-top: 3px solid var(--secondary);
+    box-shadow: 0 3px 16px -10px rgb(16 36 69 / 20%);
+  }
+
+  .nexora-catalog .nexora-model-card:hover,
+  .nexora-catalog .nexora-model-card:focus-within {
+    border-top-color: var(--primary);
+  }
+
+  .nexora-catalog .nexora-model-price {
+    padding: 0.875rem;
+    border: 1px solid var(--border);
+    border-radius: 0.625rem;
+    background: var(--muted);
+  }
+
+  .nexora-catalog .nexora-filter-chip[aria-pressed='true'],
+  .nexora-catalog-overlay .nexora-filter-chip[aria-pressed='true'] {
+    color: var(--secondary-foreground);
+    background: var(--secondary);
+    border-color: var(--input);
+  }
+
+  .nexora-catalog-overlay {
+    background: linear-gradient(var(--secondary), var(--card) 12rem);
+  }
+}
+
 @layer base {
   :root {
     /* Mobile browser toolbars change dvh; 50% positioning and vh still use
@@ -743,5 +830,260 @@ For commercial licensing, please contact support@quantumnous.com
 @media (prefers-reduced-motion: reduce) {
   .auto-group-flow-border {
     display: none;
+  }
+}
+
+/* NEXORA sign-in: scoped to the login page; other auth screens keep their layout. */
+.nexora-sign-in {
+  --login-blue: #2454eb;
+  min-height: 100svh;
+  color: var(--foreground);
+  background: linear-gradient(115deg, #edf5ff 0%, #f4f8ff 48%, #fff 48%);
+}
+.nexora-sign-in-header {
+  max-width: 1440px;
+  margin: 0 auto;
+  padding: 32px 56px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.nexora-sign-in-brand {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  font-size: 25px;
+  font-weight: 700;
+  letter-spacing: -1px;
+}
+.nexora-sign-in-main {
+  display: grid;
+  grid-template-columns: 1.1fr 1fr;
+  gap: 80px;
+  align-items: center;
+  max-width: 1280px;
+  min-height: calc(100svh - 104px);
+  margin: 0 auto;
+  padding: 36px 56px 64px;
+}
+.nexora-sign-in-story {
+  min-width: 0;
+}
+.nexora-sign-in-eyebrow {
+  color: var(--login-blue);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  line-height: 1.7;
+}
+.nexora-sign-in-story h1 {
+  margin: 20px 0;
+  font-size: clamp(36px, 3.5vw, 52px);
+  font-weight: 700;
+  line-height: 1.35;
+  letter-spacing: -0.04em;
+  text-wrap: balance;
+}
+.nexora-sign-in-story h1 span {
+  color: var(--login-blue);
+}
+.nexora-sign-in-description {
+  max-width: 410px;
+  color: var(--muted-foreground);
+  font-size: 15px;
+  line-height: 1.9;
+  text-wrap: pretty;
+}
+.nexora-sign-in-visual {
+  position: relative;
+  height: 270px;
+  max-width: 470px;
+}
+.nexora-sign-in-orbit {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 330px;
+  height: 220px;
+  transform: translate(-50%, -50%) rotate(-20deg);
+  border: 1px solid rgb(55 111 238 / 16%);
+  border-radius: 50%;
+}
+.nexora-sign-in-orbit-inner {
+  width: 245px;
+  height: 160px;
+  transform: translate(-50%, -50%) rotate(25deg);
+}
+.nexora-sign-in-core {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  display: grid;
+  place-items: center;
+  width: 100px;
+  height: 100px;
+  transform: translate(-50%, -50%) rotate(-8deg);
+  border: 1px solid rgb(255 255 255 / 90%);
+  border-radius: 28px;
+  background: linear-gradient(145deg, #fff, #e5f0ff);
+  box-shadow: 0 18px 55px rgb(39 95 220 / 16%);
+}
+.nexora-sign-in-core img {
+  width: 58px;
+  height: 58px;
+  object-fit: contain;
+  transform: rotate(8deg);
+}
+.nexora-sign-in-node,
+.nexora-sign-in-code {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  border: 1px solid rgb(111 153 225 / 18%);
+  border-radius: 14px;
+  background: rgb(255 255 255 / 94%);
+  padding: 14px 18px;
+  font-size: 13px;
+  font-weight: 600;
+  box-shadow: 0 10px 30px rgb(44 93 166 / 5%);
+}
+.nexora-sign-in-node span {
+  color: #2454eb;
+  font-size: 20px;
+}
+.nexora-sign-in-node-chat {
+  left: 2%;
+  top: 48px;
+  transform: rotate(-5deg);
+}
+.nexora-sign-in-node-video {
+  right: 0;
+  top: 116px;
+  transform: rotate(5deg);
+}
+.nexora-sign-in-code {
+  bottom: 15px;
+  left: 12%;
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+}
+.nexora-sign-in-code span {
+  color: #2454eb;
+}
+.nexora-sign-in-benefits {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 24px;
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+.nexora-sign-in-benefits span::before {
+  content: '';
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  margin-right: 8px;
+  border-radius: 50%;
+  background: #4d7df0;
+  vertical-align: middle;
+}
+.nexora-sign-in-panel {
+  width: 100%;
+  max-width: 440px;
+  justify-self: end;
+  min-width: 0;
+}
+.nexora-sign-in-form {
+  padding: 36px;
+  border: 1px solid var(--border);
+  border-radius: 24px;
+  background: var(--background);
+  box-shadow: 0 16px 64px rgb(30 62 120 / 5%);
+}
+.nexora-sign-in-form input {
+  min-height: 44px;
+  border-radius: 10px;
+}
+.nexora-sign-in-form button[type='submit'] {
+  min-height: 44px;
+  border-radius: 10px;
+  background: #2454eb;
+  color: #fff;
+}
+.nexora-sign-in-form button[type='submit']:hover:not(:disabled) {
+  background: #1944cf;
+}
+.nexora-sign-in-home {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 26px;
+  color: var(--muted-foreground);
+  font-size: 13px;
+}
+.nexora-sign-in-home:hover {
+  color: var(--login-blue);
+}
+.dark .nexora-sign-in {
+  --login-blue: #8babff;
+  background: linear-gradient(
+    115deg,
+    #101d35 0%,
+    #101929 48%,
+    var(--background) 48%
+  );
+}
+.dark .nexora-sign-in-core {
+  background: linear-gradient(145deg, #233657, #16243e);
+  border-color: #334767;
+}
+.dark .nexora-sign-in-node,
+.dark .nexora-sign-in-code {
+  background: #19263d;
+}
+.dark .nexora-sign-in-node span,
+.dark .nexora-sign-in-code span {
+  color: #8babff;
+}
+@media (max-width: 1023px) {
+  .nexora-sign-in {
+    background: linear-gradient(160deg, #eef5ff, #fff 65%);
+  }
+  .dark .nexora-sign-in {
+    background: linear-gradient(160deg, #101d35, var(--background) 65%);
+  }
+  .nexora-sign-in-header {
+    padding: 24px 28px;
+  }
+  .nexora-sign-in-main {
+    display: flex;
+    justify-content: center;
+    min-height: calc(100svh - 88px);
+    padding: 32px 24px 48px;
+  }
+  .nexora-sign-in-story {
+    display: none;
+  }
+  .nexora-sign-in-panel {
+    max-width: 440px;
+  }
+}
+@media (max-width: 479px) {
+  .nexora-sign-in-header {
+    padding: 20px;
+  }
+  .nexora-sign-in-brand {
+    font-size: 22px;
+    gap: 10px;
+  }
+  .nexora-sign-in-main {
+    align-items: flex-start;
+    padding: 32px 16px;
+  }
+  .nexora-sign-in-form {
+    padding: 28px 22px;
+    border-radius: 20px;
   }
 }

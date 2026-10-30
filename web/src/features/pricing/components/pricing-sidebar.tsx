@@ -96,7 +96,7 @@ function FilterChip(props: {
       size='sm'
       onClick={props.onClick}
       aria-pressed={props.active}
-      className='h-auto max-w-full gap-1.5 px-2 py-1 text-xs'
+      className='nexora-filter-chip h-auto max-w-full gap-1.5 px-2 py-1 text-xs'
       title={props.option.label}
     >
       {props.option.icon && (
@@ -259,7 +259,12 @@ export const PricingSidebar = memo(function PricingSidebar(
   ]
 
   return (
-    <aside className={cn('bg-card rounded-xl border p-3', props.className)}>
+    <aside
+      className={cn(
+        'nexora-catalog-sidebar bg-card rounded-xl border p-4',
+        props.className
+      )}
+    >
       <div className='mb-2.5 flex items-center justify-between gap-2'>
         <div>
           <h2 className='text-foreground text-sm font-bold'>{t('Filter')}</h2>
