@@ -31,11 +31,12 @@ try {
     console.log('Dreamina bridge listening on ' + config.host + ':' + config.port);
     async function poll() {
       if (stopping) return;
+      // Keep scheduling free workers while other CLI calls are still waiting.
+      timer = setTimeout(poll, config.pollMs);
       try { await bridge.tick(); } catch {
         console.error('Job persistence failed; bridge stopped to protect submission identities.');
         await stop(1); return;
       }
-      if (!stopping) timer = setTimeout(poll, config.pollMs);
     }
     timer = setTimeout(poll, 0);
     process.once('SIGINT', () => void stop());

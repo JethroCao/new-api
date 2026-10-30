@@ -258,7 +258,7 @@ const mp4 = Buffer.from('000000186674797069736f6d0000020069736f6d', 'hex');
 async function videoFixture(t, handler, overrides = {}) {
   const dir=await mkdtemp(join(tmpdir(),'dreamina-video-'));
   t.after(()=>rm(dir,{recursive:true,force:true}));
-  const cfg=validateConfig({...config(dir),models:Object.fromEntries(liveCatalog.items.map(m=>[m.model,{kind:'video',model:m.model,maxCredits:100}])),...overrides});
+  const cfg=validateConfig({...config(dir),maxConcurrent:100,models:Object.fromEntries(liveCatalog.items.map(m=>[m.model,{kind:'video',model:m.model,maxCredits:100}])),...overrides});
   const cli=async args=>{
     if(args[0]==='space') return context;
     if(args[0]==='model' && args[1]==='list') return liveCatalog;
@@ -437,7 +437,7 @@ test('long reference upload cannot bypass gateway lease or cause a paid submissi
   let paid=0;
   const {bridge}=await videoFixture(t,async a=>{
     if(a[0]==='node')paid++;
-    t.mock.timers.tick(16000);
+    t.mock.timers.tick(301000);
     return {resourceId:a.find(x=>x.startsWith('--resource-id=')).slice(14),mediaType:'image'};
   });
   const j=await bridge.submit({kind:'video',model:'seedance_2.5',references:[{type:'image',url:'data:image/png;base64,'+png.toString('base64')}]},'slow-upload');
