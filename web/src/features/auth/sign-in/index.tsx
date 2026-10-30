@@ -31,12 +31,16 @@ export function SignIn() {
   const { status } = useStatus()
 
   return (
-    <AuthLayout>
+    <AuthLayout variant='split'>
       <div className='w-full space-y-8'>
         <div className='space-y-2'>
-          <h2 className='text-center text-2xl font-semibold tracking-tight sm:text-left'>
-            {t('Sign in')}
+          <p className='nexora-sign-in-eyebrow'>{t('Your AI workspace')}</p>
+          <h2 className='text-3xl font-semibold tracking-tight'>
+            {t('Welcome back!')}
           </h2>
+          <p className='text-muted-foreground text-sm leading-relaxed'>
+            {t('Sign in to manage your API keys, usage and creations.')}
+          </p>
           {!status?.self_use_mode_enabled &&
             status?.register_enabled !== false && (
               <p className='text-muted-foreground text-left text-sm sm:text-base'>
@@ -47,7 +51,6 @@ export function SignIn() {
                 >
                   {t('Sign up')}
                 </Link>
-                .
               </p>
             )}
         </div>

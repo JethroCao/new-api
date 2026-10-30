@@ -19,16 +19,89 @@ For commercial licensing, please contact support@quantumnous.com
 import { Link } from '@tanstack/react-router'
 import { useTranslation } from 'react-i18next'
 
+import { LanguageSwitcher } from '@/components/language-switcher'
+import { ThemeSwitch } from '@/components/theme-switch'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useSystemConfig } from '@/hooks/use-system-config'
 
 type AuthLayoutProps = {
   children: React.ReactNode
+  variant?: 'default' | 'split'
 }
 
-export function AuthLayout({ children }: AuthLayoutProps) {
+export function AuthLayout({ children, variant = 'default' }: AuthLayoutProps) {
   const { t } = useTranslation()
   const { systemName, logo, loading } = useSystemConfig()
+
+  if (variant === 'split') {
+    return (
+      <div className='nexora-sign-in'>
+        <header className='nexora-sign-in-header'>
+          <Link to='/' className='nexora-sign-in-brand'>
+            {loading ? (
+              <Skeleton className='size-10 rounded-lg' />
+            ) : (
+              <img src={logo} alt='' className='size-10 object-contain' />
+            )}
+            {loading ? <Skeleton className='h-7 w-28' /> : systemName}
+          </Link>
+          <div className='flex items-center gap-1'>
+            <LanguageSwitcher />
+            <ThemeSwitch />
+          </div>
+        </header>
+
+        <main className='nexora-sign-in-main'>
+          <section
+            className='nexora-sign-in-story'
+            aria-labelledby='sign-in-story-title'
+          >
+            <p className='nexora-sign-in-eyebrow'>AI · API · POSSIBILITY</p>
+            <h1 id='sign-in-story-title'>
+              {t('Your ideas,')}
+              <br />
+              <span>{t('connected to possibility.')}</span>
+            </h1>
+            <p className='nexora-sign-in-description'>
+              {t(
+                'Connect AI models through one platform. Turn your next idea into an application.'
+              )}
+            </p>
+
+            <div className='nexora-sign-in-visual' aria-hidden='true'>
+              <div className='nexora-sign-in-orbit' />
+              <div className='nexora-sign-in-orbit nexora-sign-in-orbit-inner' />
+              <div className='nexora-sign-in-core'>
+                {!loading && <img src={logo} alt='' />}
+              </div>
+              <div className='nexora-sign-in-node nexora-sign-in-node-chat'>
+                <span>&lt;/&gt;</span> Chat API
+              </div>
+              <div className='nexora-sign-in-node nexora-sign-in-node-video'>
+                <span>▷</span> Video API
+              </div>
+              <div className='nexora-sign-in-code'>
+                <span>POST</span> /v1/videos
+              </div>
+            </div>
+
+            <div className='nexora-sign-in-benefits'>
+              <span>{t('Unified access')}</span>
+              <span>{t('Usage visibility')}</span>
+              <span>{t('Built for developers')}</span>
+            </div>
+          </section>
+
+          <section className='nexora-sign-in-panel' aria-label={t('Sign in')}>
+            <div className='nexora-sign-in-form'>{children}</div>
+            <Link to='/' className='nexora-sign-in-home'>
+              <span aria-hidden='true'>←</span> {t('Back to Home')}
+            </Link>
+          </section>
+        </main>
+      </div>
+    )
+  }
 
   return (
     <div className='relative grid h-svh max-w-none'>
