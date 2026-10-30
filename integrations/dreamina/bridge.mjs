@@ -23,7 +23,7 @@ function equal(a, b) {
 export function validateConfig(input) {
   const c = { host: '127.0.0.1', port: 8787, profile: 'default', region: 'cn',
     pollMs: 5000, commandTimeoutMs: 120000, maxQueue: 20, maxJobs: 1000,
-    maxConcurrent: 2, maxAdmissions: 2, maxInputBytes: 64 * 1024 * 1024, maxMediaBytes: 512 * 1024 * 1024, mediaTTL: 3600, maxQueueWaitSeconds: 1800, leaseSeconds: 15, unlimitedCredits: false, canvasTaskLimit: 0, ...input };
+    maxConcurrent: 2, maxAdmissions: 2, maxInputBytes: 64 * 1024 * 1024, maxMediaBytes: 512 * 1024 * 1024, mediaTTL: 3600, maxQueueWaitSeconds: 1800, leaseSeconds: 300, submitWorkers: 6, pollWorkers: 2, unlimitedCredits: false, canvasTaskLimit: 0, ...input };
   if (![0,5].includes(c.canvasTaskLimit)) fail('invalid config canvasTaskLimit (0 or 5)');
   if (typeof c.unlimitedCredits !== 'boolean') fail('invalid config unlimitedCredits');
   if (typeof c.token !== 'string' || c.token.length < 32 || /\s/.test(c.token)) fail('config token must have at least 32 non-whitespace characters');
@@ -37,7 +37,7 @@ export function validateConfig(input) {
   c.publicUrl = url.origin;
   for (const [key, min, max] of [['port', 1, 65535], ['pollMs', 1000, 60000], ['commandTimeoutMs', 1000, 600000],
     ['maxQueue', 1, 200], ['maxConcurrent', 1, 200], ['maxAdmissions', 1, 200], ['maxInputBytes', 1, 64 * 1024 * 1024], ['maxJobs', 1, 100000], ['maxMediaBytes', 1, 1073741824], ['mediaTTL', 60, 86400],
-    ['maxQueueWaitSeconds', 1, 1800], ['leaseSeconds', 1, 15]]) {
+    ['maxQueueWaitSeconds', 1, 1800], ['leaseSeconds', 1, 300], ['submitWorkers', 1, 6], ['pollWorkers', 1, 2]]) {
     if (!integer(c[key], min, max)) fail('invalid config ' + key);
   }
   if (!c.models || Array.isArray(c.models) || !Object.keys(c.models).length) fail('config models are required');
@@ -141,7 +141,8 @@ export class Bridge {
     this.cli = cli || (args => runCLI(config.cli, ['--format=json', '--non-interactive', '--profile=' + config.profile, '--region=' + config.region, ...args], config.commandTimeoutMs));
     this.contextKey = hash(JSON.stringify([config.profile, config.region, config.userId, config.space, config.projectId, config.models]));
     this.jobs = new Map(); this.keys = new Map(); this.admissions = Promise.resolve();
-    this.lastQueuedId = null;
+    this.lastQueuedId = null; this.lastPolledId = null;
+    this.inFlight = new Map();
     this.promptLimits = new Map();
     this.videoCatalog = new Map();
     this.leases = new Map(); // Deliberately not restored after downtime.
@@ -151,7 +152,7 @@ export class Bridge {
     if (this.closed) return;
     this.closed = true;
     await this.admissions;
-    if (this.running) await this.running;
+    await Promise.allSettled([...this.inFlight.values()].map(work => work.promise));
     if (this.lock) { await this.lock.close(); await unlink(join(this.config.dataDir, '.lock')).catch(e => { if (e.code !== 'ENOENT') throw e; }); }
   }
 
@@ -252,7 +253,8 @@ export class Bridge {
         if (existing.digest !== digest) fail('idempotency conflict', 409);
         return this.get(existing.id);
       }
-      if (this.jobs.size >= this.config.maxJobs || [...this.jobs.values()].filter(j => !terminal(j)).length >= this.config.maxQueue) fail('queue/storage capacity reached', 429);
+      if (request.n > this.config.maxConcurrent) fail('requested count exceeds generation capacity', 429);
+      if (this.jobs.size >= this.config.maxJobs || [...this.jobs.values()].filter(j => !terminal(j)).reduce((n,j) => n + j.request.n, 0) + request.n > this.config.maxQueue) fail('queue/storage capacity reached', 429);
       const job = { id: randomUUID(), key: keyHash, digest, context: this.contextKey, request,
         nodeId: 'node_' + Array.from(randomBytes(10), b => '0123456789abcdefghjkmnpqrstvwxyz'[b & 31]).join(''), updateId: randomUUID(), submitId: randomUUID(),
         status: 'queued', created_at: Math.floor(Date.now() / 1000), files: [], inputs: [] };
@@ -334,31 +336,43 @@ export class Bridge {
 
   tick() {
     if (this.closed) return Promise.resolve();
-    if (this.running) return this.running;
-    this.running = this.step().finally(() => { this.running = null; });
-    return this.running;
-  }
-
-  async step() {
-    for (const queued of this.jobs.values()) {
-      if (queued.status === 'queued' && Date.now() >= (queued.created_at + this.config.maxQueueWaitSeconds) * 1000) {
-        this.failed(queued, 'queue_expired'); await this.save(queued);
+    if (this.schedulerError) return Promise.reject(this.schedulerError);
+    const pending = [];
+    // Reserve worker and generation slots synchronously before starting any
+    // asynchronous work. Overlapping timer ticks cannot dispatch a job twice.
+    let occupied = [...this.jobs.values()].reduce((n,j) => n +
+      (j.status === 'in_progress' || j.status === 'queued' && this.inFlight.has(j.id) ? j.request.n : 0), 0);
+    for (const lane of ['poll', 'submit']) {
+      const workers = [...this.inFlight.values()].filter(w => w.lane === lane);
+      let available = this.config[lane === 'poll' ? 'pollWorkers' : 'submitWorkers'] - workers.length;
+      const busyCanvases = new Set(workers.map(w => w.projectId));
+      const candidates = [...this.jobs.values()].filter(j => j.status === (lane === 'poll' ? 'in_progress' : 'queued'));
+      const cursor = lane === 'poll' ? 'lastPolledId' : 'lastQueuedId';
+      const previous = candidates.findIndex(j => j.id === this[cursor]);
+      for (let offset = 1; offset <= candidates.length && available > 0; offset++) {
+        const job = candidates[(previous + offset) % candidates.length];
+        if (this.inFlight.has(job.id)) continue;
+        const expired = job.status === 'queued' && Date.now() >= (job.created_at + this.config.maxQueueWaitSeconds) * 1000;
+        const projectId = this.projectId(job);
+        if (lane === 'submit' && !expired) {
+          if (!(this.leases.get(job.id) > Date.now()) || occupied + job.request.n > this.config.maxConcurrent || busyCanvases.has(projectId)) continue;
+          occupied += job.request.n;
+          busyCanvases.add(projectId);
+        }
+        available--; this[cursor] = job.id;
+        const work = {lane, projectId};
+        this.inFlight.set(job.id, work);
+        work.promise = Promise.resolve().then(async () => {
+          if (expired) { this.failed(job, 'queue_expired'); await this.save(job); }
+          else await this.processJob(job);
+        }).catch(error => {
+          this.schedulerError = error;
+          throw error;
+        }).finally(() => { this.inFlight.delete(job.id); });
+        pending.push(work.promise);
       }
     }
-    for (const active of this.jobs.values()) if (active.status === 'in_progress') await this.processJob(active);
-    if ([...this.jobs.values()].filter(j => j.status === 'in_progress').length >= this.config.maxConcurrent) return;
-    // Round-robin preparation, at most one attempt per polling interval. An
-    // unavailable reference/model must not monopolize every free slot while
-    // the same user's polling keeps its lease alive.
-    const queued = [...this.jobs.values()].filter(j => j.status === 'queued');
-    const previous = queued.findIndex(j => j.id === this.lastQueuedId);
-    for (let offset = 1; offset <= queued.length; offset++) {
-      const job = queued[(previous + offset) % queued.length];
-      if (!(this.leases.get(job.id) > Date.now())) continue;
-      this.lastQueuedId = job.id;
-      await this.processJob(job);
-      break;
-    }
+    return Promise.all(pending).then(() => {});
   }
 
   async processJob(job) {
@@ -366,6 +380,7 @@ export class Bridge {
       job.attention = error.message === 'context_mismatch' ? 'context_mismatch' : 'cli_unavailable';
       await this.save(job); return;
     }
+    if (this.closed) return;
     delete job.attention;
     if (job.status === 'queued') {
       // A context check may itself take a long time. Re-check the start window
@@ -378,6 +393,7 @@ export class Bridge {
         await this.canvases.ensureCreated(this.projectId(job), canvas =>
           this.cli(['canvas','create',canvas.name,'--project-id='+canvas.projectId]));
       } catch { job.attention='canvas_creation_pending';await this.save(job);return; }
+      if (this.closed) return;
       if (Date.now() >= (job.created_at+this.config.maxQueueWaitSeconds)*1000 || !(this.leases.get(job.id)>Date.now())) {
         job.attention='awaiting_gateway';await this.save(job);return;
       }
@@ -398,6 +414,7 @@ export class Bridge {
         } catch { job.attention='model_unavailable'; await this.save(job); return; }
         try {
           for (const input of job.inputs || []) {
+            if (this.closed) return;
             if(input.uploaded) continue;
             const path=join(this.config.dataDir,input.filename);
             if(hash(await readFile(path))!==input.sha256) fail('input checksum mismatch');
@@ -412,6 +429,7 @@ export class Bridge {
           job.attention='awaiting_gateway';await this.save(job);return;
         }
       }
+      if (this.closed) return;
       // Durable transition BEFORE any remote mutation. A crash from here on
       // only permits read-only recovery of this exact submit identity.
       job.status = 'in_progress';
@@ -470,6 +488,7 @@ export class Bridge {
     if (!successful.length) { this.failed(job, 'generation_failed', ...resources.filter(r => r.state === 'failed'), operation.submission, operation); await this.save(job); return; }
     try {
       for (let i = 0; i < successful.length; i++) {
+        if (this.closed) return;
         const resourceId = successful[i].resourceId;
         if (!ID.test(resourceId)) fail('invalid resource ID');
         if (job.files[i]?.resourceId === resourceId) continue;
@@ -554,7 +573,11 @@ export function createServer(bridge) {
         equal(url.searchParams.get('sig') || '', bridge.sign(url.pathname, expires));
       if (!bearer && !(signed && ['GET', 'HEAD'].includes(req.method))) fail('unauthorized', 401);
       if (media && ['GET', 'HEAD'].includes(req.method)) return await content(bridge, req, res, media[1], Number(media[2]));
-      if (req.method === 'GET' && url.pathname === '/healthz') return json(res, 200, { status: 'ok', queued: [...bridge.jobs.values()].filter(j => !terminal(j)).length });
+      if (req.method === 'GET' && url.pathname === '/healthz') return json(res, 200, { status: bridge.schedulerError ? 'error' : 'ok', queued: [...bridge.jobs.values()].filter(j => !terminal(j)).length,
+        waiting: [...bridge.jobs.values()].filter(j => j.status === 'queued').length,
+        running: [...bridge.jobs.values()].filter(j => j.status === 'in_progress').length,
+        submit_workers: [...bridge.inFlight.values()].filter(w => w.lane === 'submit').length,
+        poll_workers: [...bridge.inFlight.values()].filter(w => w.lane === 'poll').length });
       if (req.method === 'POST' && url.pathname === '/v1/jobs') {
         if ((req.headers['content-type'] || '').split(';')[0].trim() !== 'application/json') fail('JSON required', 415);
         if (admissions >= bridge.config.maxAdmissions) fail('submission admission capacity reached', 429);

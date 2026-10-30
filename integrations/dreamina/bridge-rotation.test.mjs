@@ -14,7 +14,7 @@ const request={kind:'video',model:'seedance_2.5',prompt:'a paper boat',seconds:5
 const flag=(a,name)=>a.find(v=>v.startsWith('--'+name+'='))?.slice(name.length+3);
 async function fixture(t,overrides={},handler) {
   const dir=await mkdtemp(join(tmpdir(),'bridge-rotation-'));t.after(()=>rm(dir,{recursive:true,force:true}));
-  const cfg=validateConfig({token:'test-only-rotation-key-32-characters',dataDir:dir,cli:process.execPath,profile:'bridge',projectId:legacy,userId:'123',space:'personal',publicUrl:'http://127.0.0.1:8787',canvasTaskLimit:5,
+  const cfg=validateConfig({token:'test-only-rotation-key-32-characters',dataDir:dir,cli:process.execPath,profile:'bridge',projectId:legacy,userId:'123',space:'personal',publicUrl:'http://127.0.0.1:8787',canvasTaskLimit:5,maxConcurrent:100,
     models:Object.fromEntries(catalog.items.map(m=>[m.model,{kind:'video',model:m.model,maxCredits:100}])),...overrides});
   const calls=[];
   const cli=async a=>{
@@ -37,11 +37,11 @@ async function fixture(t,overrides={},handler) {
   return {bridge,cfg,cli,calls};
 }
 
-test('rotation binds batches to five-request canvases without remote work at admission',async t=>{
+test('rotation binds batches to five-video canvases without remote work at admission',async t=>{
   const {bridge,calls}=await fixture(t);
   const jobs=await Promise.all(Array.from({length:6},(_,i)=>bridge.submit({...request,n:i===0?2:1},'job-'+i)));
   const ids=jobs.map(j=>bridge.jobs.get(j.id).projectId);
-  assert.equal(new Set(ids.slice(0,5)).size,1);assert.notEqual(ids[0],ids[5]);assert.notEqual(ids[0],legacy);
+  assert.equal(new Set(ids.slice(0,4)).size,1);assert.notEqual(ids[0],ids[4]);assert.notEqual(ids[0],legacy);
   assert.ok(ids[0]);assert.equal(calls.filter(a=>a[0]==='canvas').length,0);
   assert.equal((await bridge.submit({...request,n:2},'job-0')).id,jobs[0].id);
   bridge.failed(bridge.jobs.get(jobs[0].id),'generation_failed');
@@ -116,4 +116,123 @@ test('disabling rotation after a partial admission preserves the durable reserva
   await restored.close();
   const again=await Bridge.open({...cfg,canvasTaskLimit:0},cli);t.after(()=>again.close());
   assert.equal(again.jobs.get(result.id).projectId,reserved);
+});
+
+test('100 videos use 20 canvases with six independent submissions and two independent polls',async t=>{
+  const flagValue=(a,n)=>flag(a,n);
+  let release;const held=new Promise(r=>{release=r;});
+  let holding=true;const submissions=[],polls=[];
+  const {bridge}=await fixture(t,{maxConcurrent:100,maxQueue:100,submitWorkers:6,pollWorkers:2},async a=>{
+    if(a[0]==='canvas')return {project:{projectId:flagValue(a,'project-id')}};
+    if(a[0]==='node'){submissions.push(a);if(holding)await held;return {submission:{state:'accepted'}};}
+    if(a[0]==='operation'){polls.push(a);if(holding)await held;return {state:'running',resources:[]};}
+    throw Error('unexpected command');
+  });
+  const jobs=[];
+  for(let i=0;i<100;i++)jobs.push(bridge.jobs.get((await bridge.submit(request,'parallel-'+i)).id));
+  assert.equal(new Set(jobs.map(j=>j.projectId)).size,20);
+  for(const id of new Set(jobs.map(j=>j.projectId)))assert.equal(jobs.filter(j=>j.projectId===id).length,5);
+  jobs[0].status=jobs[1].status='in_progress';
+  let first;
+  try {
+    first=bridge.tick();
+    const deadline=Date.now()+2000;
+    while((submissions.length<6 || polls.length<2) && Date.now()<deadline)await new Promise(r=>setTimeout(r,10));
+    assert.equal(submissions.length,6,'slow polling must not block six submissions');
+    assert.equal(polls.length,2);
+    assert.equal(new Set(submissions.map(a=>flagValue(a,'project-id'))).size,6,'serialize saves within each canvas');
+    await bridge.tick();
+    assert.equal(submissions.length,6,'overlapping ticks cannot exceed worker capacity');
+    assert.equal(polls.length,2);
+  } finally {holding=false;release();await first;}
+  for(let i=0;i<30 && jobs.some(j=>j.status==='queued');i++)await bridge.tick();
+  assert.equal(jobs.filter(j=>j.status==='in_progress').length,100);
+  assert.equal(submissions.length,98);
+  assert.equal(new Set(submissions.map(a=>flagValue(a,'submit-id'))).size,98);
+  await assert.rejects(bridge.submit(request,'overflow-101'),e=>e.status===429);
+});
+
+test('gateway polling gap and reference preparation do not suspend a live 100-task queue',async t=>{
+  t.mock.timers.enable({apis:['Date'],now:new Date('2026-10-30T04:00:00Z')});
+  let paid=0;
+  const {bridge}=await fixture(t,{},async a=>{
+    if(a[0]==='canvas')return {project:{projectId:flag(a,'project-id')}};
+    if(a[0]==='resource'){t.mock.timers.tick(20000);return {resourceId:flag(a,'resource-id'),mediaType:'image'};}
+    if(a[0]==='node'){paid++;return {submission:{state:'accepted'}};}
+    throw Error('unexpected');
+  });
+  const j=await bridge.submit({...request,mode:'m2v',references:[{type:'image',url:png}]},'slow-live',true);
+  bridge.observe(j.id);t.mock.timers.tick(100000);await bridge.tick();
+  assert.equal(bridge.get(j.id).status,'in_progress');assert.equal(paid,1);
+  const abandoned=await bridge.submit(request,'abandoned',true);
+  bridge.observe(abandoned.id);t.mock.timers.tick(301000);await bridge.tick();
+  assert.equal(bridge.get(abandoned.id).status,'queued');assert.equal(paid,1);
+});
+
+test('canvas capacity counts requested videos including batches and persists across restart',async t=>{
+  const {bridge,cfg,cli}=await fixture(t);
+  const a=await bridge.submit({...request,n:4},'four');
+  const b=await bridge.submit({...request,n:2},'two');
+  const c=await bridge.submit(request,'one');
+  assert.notEqual(bridge.jobs.get(a.id).projectId,bridge.jobs.get(b.id).projectId);
+  await bridge.close();
+  const reopened=await Bridge.open(cfg,cli);t.after(()=>reopened.close());await reopened.preflight();
+  await reopened.submit({...request,n:4},'another-four');
+  const totals=new Map();
+  for(const j of reopened.jobs.values())totals.set(j.projectId,(totals.get(j.projectId)||0)+j.request.n);
+  assert.ok([...totals.values()].every(n=>n<=5));
+  assert.equal((await reopened.submit({...request,n:4},'four')).id,a.id);
+});
+
+test('old five-request registry migrates counts without moving any existing jobs',async t=>{
+  const {bridge,cfg,cli}=await fixture(t);
+  const first=await bridge.submit({...request,n:4},'existing-four');
+  const last=await bridge.submit(request,'existing-one');
+  const id=bridge.jobs.get(first.id).projectId;
+  await bridge.close();
+  const path=join(cfg.dataDir,'canvases.json'),state=JSON.parse(await readFile(path,'utf8'));
+  state.version=1;for(const c of state.canvases)for(const slot of c.slots)delete slot.units;
+  await writeFile(path,JSON.stringify(state));
+  const restored=await Bridge.open(cfg,cli);t.after(()=>restored.close());await restored.preflight();
+  assert.equal(restored.jobs.get(first.id).projectId,id);assert.equal(restored.jobs.get(last.id).projectId,id);
+  const next=await restored.submit(request,'next');assert.notEqual(restored.jobs.get(next.id).projectId,id);
+  const saved=JSON.parse(await readFile(path,'utf8'));assert.equal(saved.version,2);
+  assert.deepEqual(saved.canvases.find(c=>c.projectId===id).slots.map(s=>s.units),[4,1]);
+});
+
+test('generation slots count all batch videos and cannot be oversubscribed by overlapping ticks',async t=>{
+  let release;const held=new Promise(r=>{release=r;});let holding=true,paid=0;
+  const {bridge}=await fixture(t,{maxConcurrent:5,maxQueue:10},async a=>{
+    if(a[0]==='canvas')return {project:{projectId:flag(a,'project-id')}};
+    if(a[0]==='node'){paid++;if(holding)await held;return {submission:{state:'accepted'}};}
+    if(a[0]==='operation')return {state:'running',resources:[]};
+  });
+  const a=await bridge.submit({...request,n:4},'four'),b=await bridge.submit({...request,n:2},'two');
+  let first;
+  try {
+    first=bridge.tick();await bridge.tick();
+    assert.equal(bridge.get(b.id).status,'queued');
+  } finally {holding=false;release();await first;}
+  assert.equal(paid,1);assert.equal(bridge.get(a.id).status,'in_progress');
+  await bridge.tick();assert.equal(bridge.get(b.id).status,'queued');
+  bridge.failed(bridge.jobs.get(a.id),'generation_failed');await bridge.tick();
+  assert.equal(paid,2);assert.equal(bridge.get(b.id).status,'in_progress');
+});
+
+test('shutdown drains an upload without starting a new paid operation',async t=>{
+  let release,entered;const held=new Promise(r=>{release=r;}),uploading=new Promise(r=>{entered=r;});let paid=0;
+  const {bridge,cfg,cli}=await fixture(t,{},async a=>{
+    if(a[0]==='canvas')return {project:{projectId:flag(a,'project-id')}};
+    if(a[0]==='resource'){entered();await held;return {resourceId:flag(a,'resource-id'),mediaType:'image'};}
+    if(a[0]==='node'){paid++;return {submission:{state:'accepted'}};}
+  });
+  const j=await bridge.submit({...request,mode:'m2v',references:[{type:'image',url:png}]},'shutdown');
+  const submitId=bridge.jobs.get(j.id).submitId;
+  const ticking=bridge.tick();await uploading;
+  const closing=bridge.close();release();await closing;await ticking;
+  assert.equal(paid,0);
+  const restored=await Bridge.open(cfg,cli);t.after(()=>restored.close());await restored.preflight();
+  await restored.tick();assert.equal(paid,0);
+  restored.observe(j.id);await restored.tick();assert.equal(paid,1);
+  assert.equal(restored.jobs.get(j.id).submitId,submitId);
 });
