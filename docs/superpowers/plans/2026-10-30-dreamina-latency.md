@@ -15,7 +15,7 @@ Preserve idempotency, per-canvas five-video cap and uncertain-submit recovery. N
 - [x] Implement independent download lane, fair paced polling, phase timestamps and bounded public diagnostics. Update existing lifecycle tests for separate download dispatch.
 - [x] Implement coalesced context checks and 60-second catalogue cache with fail-closed expiry. Run full bridge suite and deterministic backlog benchmark.
 - [x] Document settings and diagnostic meanings. Review complete diff and fix important findings with regression tests.
-- [ ] Stage release; run server tests and read-only preflight; back up/drain/switch; configure only Dreamina gateway polling; verify historical task continuity and artifact access without paid generation.
+- [x] Stage release; run server tests and read-only preflight; back up/drain/switch; configure only Dreamina gateway polling; verify historical task continuity and artifact access without paid generation.
 
 ## Execution record
 Baseline test first attempt hit sandbox EPERM on loopback listen; rerunning with network permission. Working in clean checkout on isolated branch perf/dreamina-task-latency, preserving the existing workspace layout.
@@ -23,3 +23,7 @@ Baseline test first attempt hit sandbox EPERM on loopback listen; rerunning with
 Baseline 69/69 passed. New feature tests failed against old implementation, then passed. Final 76/76 passed, including HTTP auth/ranges, partial completion, timeout recovery, 100-task scheduling, cache expiry, context drift, and partial-download restart. git diff --check clean.
 Independent reviewer found no critical/important issue; fixed the stale failed-poll finish timestamp with a RED→GREEN assertion and added interrupted second-download recovery coverage. Deterministic immediate-response simulation: first visit to all 100 tasks takes 245s at 2 workers/5s dispatch versus 24s at 4 workers/1s dispatch; this is a scheduler simulation, not a real generation latency claim.
 Ruling: use existing channel setting rather than changing Go polling/global 15s scheduling; only the local bridge channel gets skip-sleep. This avoids changing external providers and leaves up to one gateway scheduling cycle of synchronization delay.
+
+Deployment completed: /data/dreamina/releases/latency-lanes-20261030. Server suite 76/76; read-only CLI preflight passed. Backup: /data/dreamina/backups/latency-20261030-192757. All 330 existing task submit/node/project identities preserved. Historical task and 12,117,431-byte MP4 HEAD returned 200. Channel #1 settings changed false→true only for disable_task_polling_sleep; gateway cache refresh observed at 19:28:21, no gateway restart required.
+Live post-deployment verification: health ok; 44 observed polls with max query duration 1021ms (including transient status_unavailable); one existing task naturally completed via separate download lane, observed-success to verified-download 8404ms (download 7177ms). No new paid generation was submitted. Keep these observations separate from provider generation timing or general performance guarantees.
+Final review notes resolved; no deferred findings. Source remains on perf/dreamina-task-latency, production code backed by commit 0126d9269.
