@@ -37,7 +37,7 @@ export function validateConfig(input) {
   c.publicUrl = url.origin;
   for (const [key, min, max] of [['port', 1, 65535], ['pollMs', 1000, 60000], ['commandTimeoutMs', 1000, 600000],
     ['maxQueue', 1, 200], ['maxConcurrent', 1, 200], ['maxAdmissions', 1, 200], ['maxInputBytes', 1, 64 * 1024 * 1024], ['maxJobs', 1, 100000], ['maxMediaBytes', 1, 1073741824], ['mediaTTL', 60, 86400],
-    ['maxQueueWaitSeconds', 1, 1800], ['leaseSeconds', 1, 300], ['submitWorkers', 1, 6], ['pollWorkers', 1, 8], ['downloadWorkers', 1, 4], ['pollIntervalMs', 1000, 60000], ['catalogTTLms', 1000, 60000]]) {
+    ['maxQueueWaitSeconds', 1, 1800], ['leaseSeconds', 1, 300], ['submitWorkers', 1, 12], ['pollWorkers', 1, 8], ['downloadWorkers', 1, 4], ['pollIntervalMs', 1000, 60000], ['catalogTTLms', 1000, 60000]]) {
     if (!integer(c[key], min, max)) fail('invalid config ' + key);
   }
   if (!c.models || Array.isArray(c.models) || !Object.keys(c.models).length) fail('config models are required');
@@ -60,7 +60,7 @@ function upstreamError(sources) {
   const result = {};
   for (const source of sources) {
     if (!source || typeof source !== 'object') continue;
-    for (const candidate of [source.error, source]) {
+    for (const candidate of [source.submissionError, source.error, source]) {
       if (!candidate || typeof candidate !== 'object') continue;
       const rawCode = candidate.serviceCode ?? candidate.errorCode ?? candidate.code;
       const code = Number.isSafeInteger(rawCode) && rawCode !== 0 ? rawCode
@@ -79,19 +79,40 @@ function upstreamError(sources) {
 export function runCLI(executable, args, timeout = 120000) {
   return new Promise((resolvePromise, reject) => {
     const child = spawn(executable, args, { shell: false, stdio: ['ignore', 'pipe', 'pipe'] });
-    const chunks = []; let bytes = 0; let failure;
+    const chunks = [], stderr = []; let bytes = 0; let failure;
     const timer = setTimeout(() => { failure = new Error('CLI timeout'); child.kill('SIGKILL'); }, timeout);
     child.stdout.on('data', chunk => {
       bytes += chunk.length;
       if (bytes > 2 * 1024 * 1024) { failure = new Error('CLI output limit'); child.kill('SIGKILL'); }
       else chunks.push(chunk);
     });
-    child.stderr.resume(); // Never log CLI stderr: it may contain authentication material.
+    // Parse only structured public errors; never log or persist raw stderr.
+    child.stderr.on('data', chunk => {
+      bytes += chunk.length;
+      if (bytes > 2 * 1024 * 1024) { failure = new Error('CLI output limit'); child.kill('SIGKILL'); }
+      else stderr.push(chunk);
+    });
     child.on('error', () => { failure = new Error('CLI could not start'); });
     child.on('close', code => {
       clearTimeout(timer);
       if (failure) return reject(failure);
-      if (code !== 0) return reject(Object.assign(new Error('CLI command failed'), { exitCode: code }));
+      if (code !== 0) {
+        let cliError;
+        for (const output of [Buffer.concat(chunks).toString('utf8'),Buffer.concat(stderr).toString('utf8')]) {
+          for (const line of [output,...output.split('\n').reverse()]) {
+            try {
+              const envelope=JSON.parse(line);
+              if(envelope.ok!==false || !envelope.error)continue;
+              cliError=upstreamError([envelope.error]);
+              const requestId=envelope.meta?.requestId;
+              if(typeof requestId==='string' && /^[A-Za-z0-9_.:-]{1,160}$/.test(requestId))cliError.request_id=requestId;
+              break;
+            } catch { /* Plain stderr is deliberately discarded. */ }
+          }
+          if(cliError)break;
+        }
+        return reject(Object.assign(new Error('CLI command failed'), { exitCode: code, cliError }));
+      }
       let result;
       try { result = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return reject(new Error('CLI invalid JSON')); }
       if (result.ok !== true || !result.data) {
@@ -347,9 +368,41 @@ export class Bridge {
       ...(j.request.model === 'seedance_2.5_draft' ? {warning:'样片最长存储 7 天，过期后不可再生成正片；具体期限以即梦服务端为准'} : {}),
       seconds: j.request.seconds, image_count: j.status === 'completed' ? j.files.length : j.request.n,
       timings: j.timings ? {...j.timings} : undefined,
-      phase: terminal(j) ? j.status : j.downloadResources ? 'downloading' : j.status,
+      phase: terminal(j) ? j.status : j.attention ? 'needs_attention' : j.downloadResources ? 'downloading' : j.status,
+      recovery: this.recovery(j), diagnostics: j.diagnostics ? structuredClone(j.diagnostics) : undefined,
       progress: j.status === 'completed' ? 100 : 0, attention: j.attention, error: j.error,
       data: j.status === 'completed' && j.request.kind === 'image' ? j.files.map((f, i) => ({ url: this.mediaURL(j.id, i) })) : [] };
+  }
+
+  recovery(job) {
+    let action='wait', message='正在处理，请勿重复提交';
+    if(job.status==='completed'){action='completed';message='生成完成';}
+    else if(job.status==='failed') {
+      action='review_failure';message='任务失败，请核对原因后再提交';
+      if(String(job.error?.upstream_code)==='20005'){action='add_credits_then_resubmit';message='请补充当前成员积分后重新提交';}
+      if(['20100','20115'].includes(String(job.error?.upstream_code))){action='fix_input_then_resubmit';message='请修改输入内容后重新提交，不自动重试';}
+      if(job.error?.code==='queue_expired'){action='resubmit';message='本地排队超时，可重新提交';}
+    } else if(job.downloadResources){action='retry_download';message='正在获取生成结果，请勿重新生成';}
+    else if(['manual_recovery_required','submission_uncertain','operation_mismatch','resources_missing','resource_count_mismatch','invalid_resource_id','context_mismatch'].includes(job.attention)){
+      action='manual_review';message='提交状态待核查，请勿重复提交';
+    } else if(job.attention){action='retry_query';message='状态查询或准备异常，正在重查，请勿重复提交';}
+    return {action,message,automatic_resubmit:false};
+  }
+
+  recordIssue(job, stage, source = {}, fallback = 'status_unavailable') {
+    const upstream=upstreamError([source]);
+    const issue={code:upstream.code ?? fallback,message:this.cleanMessage(upstream.message || fallback),stage,at_ms:Date.now()};
+    if(typeof source.request_id==='string' && /^[A-Za-z0-9_.:-]{1,160}$/.test(source.request_id))issue.request_id=source.request_id;
+    job.diagnostics ||= {};
+    job.diagnostics.last_error=issue;
+    this.onEvent?.({event:'dreamina_attention',job_id:job.id,stage,code:issue.code,at_ms:issue.at_ms});
+  }
+
+  cleanMessage(message) {
+    return message.replaceAll(this.config.token, '[redacted]')
+      .replace(/Bearer\s+[A-Za-z0-9._~+\/-]+=*/gi, 'Bearer [redacted]')
+      .replace(/https?:\/\/[^\s<>"']+/gi, '[redacted URL]')
+      .replace(/((?:access_token|refresh_token|api_key|token|signature|X-Tos-Signature)=)[^\s&]+/gi, '$1[redacted]');
   }
 
   observe(id) {
@@ -385,7 +438,7 @@ export class Bridge {
       for (let offset = 1; offset <= candidates.length && available > 0; offset++) {
         const job = candidates[(previous + offset) % candidates.length];
         if (this.inFlight.has(job.id)) continue;
-        if (lane === 'poll' && Date.now() < (this.nextPoll.get(job.id) || 0)) continue;
+        if (lane === 'poll' && Date.now() < Math.max(this.nextPoll.get(job.id) || 0, job.diagnostics?.next_poll_at_ms || 0)) continue;
         if (lane === 'download' && Date.now() < (this.nextDownload.get(job.id) || 0)) continue;
         const expired = job.status === 'queued' && Date.now() >= (job.created_at + this.config.maxQueueWaitSeconds) * 1000;
         const projectId = this.projectId(job);
@@ -419,6 +472,8 @@ export class Bridge {
     if (job.status === 'queued') this.recordTime(job, 'preparation_started_at_ms');
     try { await this.checkContext(); } catch (error) {
       job.attention = error.message === 'context_mismatch' ? 'context_mismatch' : 'cli_unavailable';
+      this.recordIssue(job,'context',error.cliError,job.attention);
+      job.diagnostics.next_poll_at_ms=Date.now()+60000;
       await this.save(job); return;
     }
     if (this.closed) return;
@@ -506,7 +561,11 @@ export class Bridge {
       } catch (error) {
         // Exit 10 is documented as quotation awaiting approval, without debit.
         if (error.exitCode === 10) this.failed(job, 'credit_approval_required');
-        else job.attention = 'submission_uncertain';
+        else if(['20005','20100','20115'].includes(String(error.cliError?.code))) this.failed(job,'submission_rejected',error.cliError);
+        else {
+          job.attention = 'submission_uncertain';
+          this.recordIssue(job,'submit',error.cliError,'submission_uncertain');
+        }
       }
       await this.save(job); return;
     }
@@ -517,27 +576,42 @@ export class Bridge {
     job.timings.poll_count = (job.timings.poll_count || 0) + 1;
     let operation;
     try { operation = await this.cli(['operation', 'status', job.submitId, '--project-id=' + this.projectId(job)]); }
-    catch {
+    catch (error) {
       job.timings.last_poll_finished_at_ms = Date.now();
       job.timings.poll_error_count = (job.timings.poll_error_count || 0) + 1;
       this.onEvent?.({event:'dreamina_poll',job_id:job.id,at_ms:Date.now(),duration_ms:Date.now()-polledAt,state:'status_unavailable',poll_count:job.timings.poll_count});
-      job.attention = 'status_unavailable'; await this.save(job); return;
+      const uncertain=['cli.operation_submission_absent','cli.operation_identity_unknown','cli.operation_context_mismatch'].includes(error.cliError?.code);
+      job.attention = uncertain ? 'manual_recovery_required' : 'status_unavailable';
+      this.recordIssue(job,'query',error.cliError,'status_unavailable');
+      job.diagnostics.consecutive_query_errors=(job.diagnostics.consecutive_query_errors || 0)+1;
+      const delay=uncertain ? 60000 : Math.min(60000,5000 * 2 ** Math.min(job.diagnostics.consecutive_query_errors-1,4));
+      job.diagnostics.next_poll_at_ms=Date.now()+delay;
+      await this.save(job); return;
     }
     job.timings.last_poll_finished_at_ms = Date.now();
+    job.diagnostics ||= {};
+    job.diagnostics.consecutive_query_errors=0;
+    job.diagnostics.next_poll_at_ms=0;
+    job.diagnostics.last_query_at_ms=Date.now();
+    if(job.diagnostics.last_error && !job.diagnostics.last_error.resolved_at_ms)job.diagnostics.last_error.resolved_at_ms=Date.now();
     this.onEvent?.({event:'dreamina_poll',job_id:job.id,at_ms:Date.now(),duration_ms:Date.now()-polledAt,state:String(operation.state).slice(0,40),poll_count:job.timings.poll_count});
     if (operation.operationRef && operation.operationRef !== job.submitId) {
-      job.attention = 'operation_mismatch'; await this.save(job); return;
+      job.attention = 'operation_mismatch'; job.diagnostics.next_poll_at_ms=Date.now()+60000; await this.save(job); return;
     }
     if (String(operation.submission?.state).toLowerCase() === 'accepted' && job.timings.accepted_at_ms === undefined) this.recordTime(job, 'accepted_observed_at_ms');
     const resources = operation.resources || [];
     const state = String(operation.state).toLowerCase();
     const submission = String(operation.submission?.state).toLowerCase();
-    if (!resources.length && (submission === 'rejected' || state === 'failed')) {
+    // A failed aggregate can include successful outputs in a multi-output job.
+    // Keep those deliveries and their existing partial billing, but a pending
+    // placeholder alone must never mask a definitive upstream failure.
+    if ((submission === 'rejected' || state === 'failed') && !resources.some(r=>r.state==='succeeded')) {
       this.failed(job, 'generation_failed', ...resources.filter(r => r.state === 'failed'), operation.submission, operation); await this.save(job); return;
     }
-    if (!resources.length || resources.some(r => !['succeeded', 'failed'].includes(r.state))) {
+    if (!resources.length || (state !== 'failed' && submission !== 'rejected' && resources.some(r => !['succeeded', 'failed'].includes(r.state)))) {
       if (['absent', 'unknown', 'awaiting_confirmation'].includes(submission) || state === 'unknown') job.attention = 'manual_recovery_required';
       else if (!resources.length && ['succeeded', 'completed'].includes(state)) job.attention = 'resources_missing';
+      if(job.attention)job.diagnostics.next_poll_at_ms=Date.now()+60000;
       await this.save(job); return;
     }
     if (resources.length !== job.request.n || new Set(resources.map(r => r.resourceId)).size !== resources.length) {
@@ -576,11 +650,15 @@ export class Bridge {
     let message = upstream.message || (upstream.code !== undefined ? 'Dreamina service error: ' + upstream.code : code.replaceAll('_', ' '));
     // Operator-confirmed meaning; keep the machine-readable upstream code.
     if (String(upstream.code) === '20115') message = '20115:本次生成的输出视频未通过版权审核';
+    if (String(upstream.code) === '20100') message = '20100:本次输入文本敏感，已被安全审核拦截';
+    if (String(upstream.code) === '20005') message = '20005:即梦当前成员可用积分不足';
     // Public error text is retained; known credentials are never echoed.
-    message = message.replaceAll(this.config.token, '[redacted]')
-      .replace(/Bearer\s+[A-Za-z0-9._~+\/-]+=*/gi, 'Bearer [redacted]')
-      .replace(/((?:access_token|refresh_token|api_key|token|signature|X-Tos-Signature)=)[^\s&]+/gi, '$1[redacted]');
+    message = this.cleanMessage(message);
     job.status = 'failed';
+    job.completed_at = Math.floor(Date.now()/1000);
+    delete job.attention;
+    this.recordIssue(job,'terminal',upstream,code);
+    job.diagnostics.next_poll_at_ms=0;
     job.error = {code, message, ...(upstream.code !== undefined ? {upstream_code: upstream.code} : {})};
   }
 

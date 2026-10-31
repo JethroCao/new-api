@@ -13,7 +13,7 @@ export const VIDEO_MODELS = {
 };
 const MAX_INPUT_BYTES = 64 * 1024 * 1024;
 export const meta = {
-  apiVersion: 1, key: 'dreamina-cli', name: 'Dreamina CLI Video', icon: 'text:即梦', version: '0.2.1',
+  apiVersion: 1, key: 'dreamina-cli', name: 'Dreamina CLI Video', icon: 'text:即梦', version: '0.2.2',
   'author': { name: 'JethroCao' },
   'description': { en: 'Video generation through the official Dreamina Canvas CLI', zh: '通过官方即梦画布 CLI 生成视频' },
   'models': Object.keys(VIDEO_MODELS).concat(['dreamina-video']),
@@ -153,6 +153,12 @@ export function parseTaskResult(ctx, body, response) {
   const result={status:status};
   if (status==='SUCCESS') result.progress='100%';
   if (status==='FAILURE') result.reason=body.error && body.error.message || 'Dreamina generation failed';
+  if (status==='FAILURE' && body.recovery && body.recovery.message) result.reason+='；'+String(body.recovery.message).slice(0,4096);
+  // Existing task log/details fields support text, so abnormal tasks need not
+  // masquerade as a fixed 30% progress value or require a new gateway status.
+  const action=body && body.recovery && body.recovery.action;
+  const progress={manual_review:'提交状态待核查',retry_query:'查询异常，正在重查',retry_download:'正在获取视频'};
+  if(progress[action])result.progress=progress[action];
   if (status==='UNKNOWN') result.reason='Unrecognized bridge task status';
   return result;
 }
@@ -179,6 +185,19 @@ export function buildContentRequest(ctx) {
 export const protocols={openai_video:{decodeRequest:decode,render:function(ctx,task){
   const d=task.data||{}, result={};
   for (const key of ['seconds','n','video_count','resolution','ratio','mode','warning']) if(d[key]!==undefined) result[key]=d[key];
+  if(d.recovery && ['wait','completed','manual_review','retry_query','retry_download','add_credits_then_resubmit','fix_input_then_resubmit','review_failure','resubmit'].includes(d.recovery.action)) {
+    result.recovery={action:d.recovery.action,message:String(d.recovery.message || '').slice(0,4096),automatic_resubmit:false};
+  }
+  if(d.phase)result.phase=d.phase;
+  if(d.diagnostics) {
+    result.diagnostics={};
+    for(const key of ['last_query_at_ms','next_poll_at_ms','consecutive_query_errors'])if(Number.isSafeInteger(d.diagnostics[key]))result.diagnostics[key]=d.diagnostics[key];
+    const e=d.diagnostics.last_error;
+    if(e) {
+      result.diagnostics.last_error={};
+      for(const key of ['code','message','request_id','stage','at_ms','resolved_at_ms'])if(typeof e[key]==='string' || Number.isSafeInteger(e[key]))result.diagnostics.last_error[key]=e[key];
+    }
+  }
   if(task.status==='FAILURE') {
     result.error={code:'video_generation_failed',message:task.fail_reason||'Dreamina generation failed'};
     const upstream=d.error && d.error.upstream_code;

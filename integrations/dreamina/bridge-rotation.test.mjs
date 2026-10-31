@@ -120,11 +120,11 @@ test('disabling rotation after a partial admission preserves the durable reserva
   assert.equal(again.jobs.get(result.id).projectId,reserved);
 });
 
-test('100 videos use 20 canvases with six independent submissions and two independent polls',async t=>{
+for (const submitWorkers of [6,12]) test(`100 videos use 20 canvases with ${submitWorkers} independent submissions and two independent polls`,async t=>{
   const flagValue=(a,n)=>flag(a,n);
   let release;const held=new Promise(r=>{release=r;});
   let holding=true;const submissions=[],polls=[];
-  const {bridge}=await fixture(t,{maxConcurrent:100,maxQueue:100,submitWorkers:6,pollWorkers:2},async a=>{
+  const {bridge}=await fixture(t,{maxConcurrent:100,maxQueue:100,submitWorkers,pollWorkers:2},async a=>{
     if(a[0]==='canvas')return {project:{projectId:flagValue(a,'project-id')}};
     if(a[0]==='node'){submissions.push(a);if(holding)await held;return {submission:{state:'accepted'}};}
     if(a[0]==='operation'){polls.push(a);if(holding)await held;return {state:'running',resources:[]};}
@@ -139,12 +139,12 @@ test('100 videos use 20 canvases with six independent submissions and two indepe
   try {
     first=bridge.tick();
     const deadline=Date.now()+2000;
-    while((submissions.length<6 || polls.length<2) && Date.now()<deadline)await new Promise(r=>setTimeout(r,10));
-    assert.equal(submissions.length,6,'slow polling must not block six submissions');
+    while((submissions.length<submitWorkers || polls.length<2) && Date.now()<deadline)await new Promise(r=>setTimeout(r,10));
+    assert.equal(submissions.length,submitWorkers,'slow polling must not block submissions');
     assert.equal(polls.length,2);
-    assert.equal(new Set(submissions.map(a=>flagValue(a,'project-id'))).size,6,'serialize saves within each canvas');
+    assert.equal(new Set(submissions.map(a=>flagValue(a,'project-id'))).size,submitWorkers,'serialize saves within each canvas');
     await bridge.tick();
-    assert.equal(submissions.length,6,'overlapping ticks cannot exceed worker capacity');
+    assert.equal(submissions.length,submitWorkers,'overlapping ticks cannot exceed worker capacity');
     assert.equal(polls.length,2);
   } finally {holding=false;release();await first;}
   for(let i=0;i<30 && jobs.some(j=>j.status==='queued');i++)await bridge.tick();

@@ -114,7 +114,7 @@ test('empty resource collection and unsupported video download never produce suc
   const job = await bridge.submit({ kind: 'video', model: 'dreamina-video', prompt: 'waves', seconds: 5 }, 'video');
   await bridge.tick(); await bridge.tick();
   assert.notEqual(bridge.get(job.id).status, 'completed');
-  empty = false; await bridge.tick(); await bridge.tick();
+  empty = false; bridge.jobs.get(job.id).diagnostics.next_poll_at_ms=0; await bridge.tick(); await bridge.tick();
   assert.notEqual(bridge.get(job.id).status, 'completed');
   await bridge.tick();
   assert.equal(bridge.get(job.id).attention, 'download_failed');
@@ -397,7 +397,7 @@ test('configured 200-slot scheduler admits and starts 200 jobs, then rejects ove
 test('multi-video partial completion counts only verified downloads and exposes every output',async t=>{
   const {bridge}=await videoFixture(t,async a=>{
     if(a[0]==='node') return {submission:{state:'accepted'}};
-    if(a[0]==='operation')return {state:'failed',resources:[{resourceId:'good1',state:'succeeded'},{resourceId:'bad',state:'failed'},{resourceId:'good2',state:'succeeded'}]};
+    if(a[0]==='operation')return {state:'failed',resources:[{resourceId:'good1',state:'succeeded'},{resourceId:'bad',state:'pending'},{resourceId:'good2',state:'succeeded'}]};
     const path=a.find(x=>x.startsWith('--output=')).slice(9);await writeFile(path,mp4);
     return {path,size:mp4.length,sha256:createHash('sha256').update(mp4).digest('hex')};
   });
@@ -521,9 +521,9 @@ test('an upload-rejected queued job cannot starve a healthy leased request',asyn
 
 test('terminal upstream failures preserve original codes and messages without private payloads', async t => {
   for (const upstream of [
-    {state:'failed',resources:[{state:'failed',resourceId:'r',serviceCode:20100}]},
-    {state:'failed',resources:[{state:'failed',resourceId:'r',serviceCode:20100}],error:{message:'Original upstream rejection'}},
-    {state:'failed',resources:[{state:'failed',resourceId:'r',serviceCode:20100,errorMessage:'内容不符合平台规则，请修改后重试',privateUrl:'https://secret'}]},
+    {state:'failed',resources:[{state:'failed',resourceId:'r',serviceCode:20999}]},
+    {state:'failed',resources:[{state:'failed',resourceId:'r',serviceCode:20999}],error:{message:'Original upstream rejection'}},
+    {state:'failed',resources:[{state:'failed',resourceId:'r',serviceCode:20999,errorMessage:'内容不符合平台规则，请修改后重试',privateUrl:'https://secret'}]},
     {state:'failed',error:{code:'ContentRejected',message:'Reference image was rejected',details:{token:'secret'}}},
   ]) await t.test(JSON.stringify(upstream.error?.code || upstream.resources[0].serviceCode)+' '+Boolean(upstream.resources?.[0].errorMessage), async t => {
     const {bridge}=await videoFixture(t,async a=>a[0]==='node'?{submission:{state:'accepted'}}:upstream);
@@ -531,8 +531,8 @@ test('terminal upstream failures preserve original codes and messages without pr
     await bridge.tick();await bridge.tick();
     const err=bridge.get(j.id).error;
     assert.equal(err.code,'generation_failed');
-    assert.equal(err.upstream_code,upstream.error?.code || 20100);
-    assert.equal(err.message,upstream.error?.message || upstream.resources[0].errorMessage || 'Dreamina service error: 20100');
+    assert.equal(err.upstream_code,upstream.error?.code || 20999);
+    assert.equal(err.message,upstream.error?.message || upstream.resources[0].errorMessage || 'Dreamina service error: 20999');
     assert.equal(JSON.stringify(err).includes('secret'),false);
   });
 });
@@ -554,8 +554,8 @@ test('copyright rejection 20115 has Chinese text in task logs and public video e
     await bridge.tick();await bridge.tick();
     const body=bridge.get(job.id);
     const parsed=plugin.parseTaskResult({},body,{status:200});
-    assert.equal(parsed.reason,'20115:本次生成的输出视频未通过版权审核');
+    assert.equal(parsed.reason,'20115:本次生成的输出视频未通过版权审核；请修改输入内容后重新提交，不自动重试');
     const output=plugin.protocols.openai_video.render({},{status:'FAILURE',fail_reason:parsed.reason,data:body});
-    assert.deepEqual(output.error,{code:'video_generation_failed',message:'20115:本次生成的输出视频未通过版权审核',upstream_code:code});
+    assert.deepEqual(output.error,{code:'video_generation_failed',message:parsed.reason,upstream_code:code});
   }
 });
