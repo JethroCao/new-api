@@ -11,9 +11,9 @@ const units=job=>job.request?.n ?? 1;
 const summary=c=>({projectId:c.projectId,name:c.name});
 
 export class CanvasPool {
-  static async open({path,context,legacyProjectId,jobs}) {
+  static async open({path,context,legacyProjectId,jobs,store}) {
     let state;
-    try {state=JSON.parse(await readFile(path,'utf8'));}
+    try {state=store?await store.readCanvas():JSON.parse(await readFile(path,'utf8'));if(!state)throw Object.assign(new Error('missing registry'),{code:'ENOENT'});}
     catch(error) {
       if(error.code!=='ENOENT')throw error;
       if(jobs.some(j=>j.projectId && j.projectId!==legacyProjectId))fail('canvas registry missing for bound jobs');
@@ -51,11 +51,11 @@ export class CanvasPool {
       if(!c.legacy || keys.has(job.key) || !HASH.test(job.key) || !HASH.test(job.digest))fail('canvas registry missing job reservation');
       c.slots.push({key:job.key,digest:job.digest,units:units(job)});keys.add(job.key);changed=true;
     }
-    if(changed)await atomicJSON(path,state);
-    return new CanvasPool(path,state);
+    if(changed || store) {if(store)await store.writeCanvas(state);else await atomicJSON(path,state);}
+    return new CanvasPool(path,state,store);
   }
 
-  constructor(path,state) {this.path=path;this.state=state;this.queue=Promise.resolve();this.creating=new Map();this.poisoned=false;}
+  constructor(path,state,store) {this.store=store;this.path=path;this.state=state;this.queue=Promise.resolve();this.creating=new Map();this.poisoned=false;}
 
   lookup(job) {
     const {key,digest}=job;
@@ -72,7 +72,7 @@ export class CanvasPool {
     const op=this.queue.then(async()=>{
       if(this.poisoned)fail('canvas registry unavailable; restart required');
       const next=structuredClone(this.state),result=fn(next);
-      try {await atomicJSON(this.path,next);}
+      try {if(this.store)await this.store.writeCanvas(next);else await atomicJSON(this.path,next);}
       catch(error) {this.poisoned=true;throw error;}
       this.state=next;return result;
     });

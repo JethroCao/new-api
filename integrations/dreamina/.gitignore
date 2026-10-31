@@ -1,3 +1,4 @@
 config.local.json
 data/
 .env
+node_modules/

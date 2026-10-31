@@ -807,7 +807,32 @@ func respondTaskSubmissionError(c *gin.Context, taskErr *taskdto.TaskError) {
 
 // respondTaskError 统一输出 Task 错误响应（含 429 限流提示改写）
 func respondTaskError(c *gin.Context, taskErr *taskdto.TaskError) {
-	if taskErr.StatusCode == http.StatusTooManyRequests {
+	// Only recognized bridge codes receive a specific, fixed public message.
+	// Never forward raw storage/driver details from an upstream error body.
+	messageKey := ""
+	if taskErr.Code == "fail_to_fetch_task" {
+		var body struct {
+			Error struct {
+				Code string `json:"code"`
+			} `json:"error"`
+		}
+		if common.UnmarshalJsonStr(taskErr.Message, &body) == nil {
+			switch {
+			case taskErr.StatusCode == http.StatusTooManyRequests && body.Error.Code == "active_queue_full":
+				messageKey = i18n.MsgRelayActiveVideoQueueFull
+			case taskErr.StatusCode == http.StatusTooManyRequests && body.Error.Code == "submission_admission_full":
+				messageKey = i18n.MsgRelaySubmissionAdmissionFull
+			case taskErr.StatusCode == http.StatusServiceUnavailable && body.Error.Code == "job_storage_unavailable":
+				messageKey = i18n.MsgRelayJobStorageUnavailable
+			}
+			if messageKey != "" {
+				taskErr.Code = body.Error.Code
+			}
+		}
+	}
+	if messageKey != "" {
+		taskErr.Message = i18n.T(c, messageKey)
+	} else if taskErr.StatusCode == http.StatusTooManyRequests {
 		taskErr.Message = i18n.T(c, i18n.MsgRelayGroupUpstreamSaturated)
 	}
 	c.JSON(taskErr.StatusCode, taskErr)

@@ -1,19 +1,21 @@
 import { createServer as httpServer } from 'node:http';
 import { spawn } from 'node:child_process';
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
-import { mkdir, open, readFile, readdir, rename, unlink, stat } from 'node:fs/promises';
+import { mkdir, open, readFile, opendir, rename, unlink, stat } from 'node:fs/promises';
 import { createReadStream } from 'node:fs';
+import { isDeepStrictEqual } from 'node:util';
 import { VIDEO_MODELS, normalizeVideo } from './plugin.js';
 import { readReference } from './media-input.mjs';
 import { isAbsolute, join } from 'node:path';
 import { atomicJSON } from './state-file.mjs';
 import { CanvasPool } from './canvas-pool.mjs';
+import { DatabaseStore, storageError } from './database-store.mjs';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const ID = /^[A-Za-z0-9_-]{1,160}$/;
 const hash = value => createHash('sha256').update(value).digest('hex');
 const terminal = job => ['completed', 'failed'].includes(job.status);
-function fail(message, status = 400) { throw Object.assign(new Error(message), { status }); }
+function fail(message, status = 400, code) { throw Object.assign(new Error(message), { status, code }); }
 function integer(value, min, max) { return Number.isSafeInteger(value) && value >= min && value <= max; }
 function equal(a, b) {
   const left = Buffer.from(a), right = Buffer.from(b);
@@ -22,8 +24,10 @@ function equal(a, b) {
 
 export function validateConfig(input) {
   const c = { host: '127.0.0.1', port: 8787, profile: 'default', region: 'cn',
-    pollMs: 1000, pollIntervalMs: 5000, catalogTTLms: 60000, commandTimeoutMs: 120000, maxQueue: 20, maxJobs: 1000,
+    storage: 'file', migrateLegacy: false, pollMs: 1000, pollIntervalMs: 5000, catalogTTLms: 60000, commandTimeoutMs: 120000, maxQueue: 20, historyCacheSize: 100,
     maxConcurrent: 2, maxAdmissions: 2, maxInputBytes: 64 * 1024 * 1024, maxMediaBytes: 512 * 1024 * 1024, mediaTTL: 3600, maxQueueWaitSeconds: 1800, leaseSeconds: 300, submitWorkers: 6, pollWorkers: 4, downloadWorkers: 2, unlimitedCredits: false, canvasTaskLimit: 0, ...input };
+  if (!['file','database'].includes(c.storage) || typeof c.migrateLegacy!=='boolean') fail('invalid storage configuration');
+  if (c.storage==='database' && !c.databaseUrl) fail('database storage requires DREAMINA_DATABASE_URL');
   if (![0,5].includes(c.canvasTaskLimit)) fail('invalid config canvasTaskLimit (0 or 5)');
   if (typeof c.unlimitedCredits !== 'boolean') fail('invalid config unlimitedCredits');
   if (typeof c.token !== 'string' || c.token.length < 32 || /\s/.test(c.token)) fail('config token must have at least 32 non-whitespace characters');
@@ -36,7 +40,7 @@ export function validateConfig(input) {
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash || url.pathname !== '/') fail('invalid config publicUrl');
   c.publicUrl = url.origin;
   for (const [key, min, max] of [['port', 1, 65535], ['pollMs', 1000, 60000], ['commandTimeoutMs', 1000, 600000],
-    ['maxQueue', 1, 200], ['maxConcurrent', 1, 200], ['maxAdmissions', 1, 200], ['maxInputBytes', 1, 64 * 1024 * 1024], ['maxJobs', 1, 100000], ['maxMediaBytes', 1, 1073741824], ['mediaTTL', 60, 86400],
+    ['maxQueue', 1, 200], ['maxConcurrent', 1, 200], ['maxAdmissions', 1, 200], ['maxInputBytes', 1, 64 * 1024 * 1024], ['historyCacheSize', 1, 1000], ['maxMediaBytes', 1, 1073741824], ['mediaTTL', 60, 86400],
     ['maxQueueWaitSeconds', 1, 1800], ['leaseSeconds', 1, 300], ['submitWorkers', 1, 12], ['pollWorkers', 1, 8], ['downloadWorkers', 1, 4], ['pollIntervalMs', 1000, 60000], ['catalogTTLms', 1000, 60000]]) {
     if (!integer(c[key], min, max)) fail('invalid config ' + key);
   }
@@ -144,24 +148,72 @@ export class Bridge {
     bridge.lock = await open(join(config.dataDir, '.lock'), 'wx', 0o600);
     try {
       await bridge.lock.writeFile(String(process.pid));
-      for (const name of await readdir(config.dataDir)) {
-        if (!/^[0-9a-f-]{36}\.json$/.test(name)) continue;
-        const job = JSON.parse(await readFile(join(config.dataDir, name), 'utf8'));
-        if (!UUID.test(job.id) || name !== job.id + '.json' || job.context !== bridge.contextKey) fail('stored job context mismatch', 503);
-        bridge.jobs.set(job.id, job);
-        bridge.keys.set(job.key, job.id);
+      let marker;
+      try {marker=JSON.parse(await readFile(join(config.dataDir,'.database-storage.json'),'utf8'));}
+      catch(error) {if(error.code!=='ENOENT')throw storageError();}
+      if(marker && (config.storage!=='database' || marker.context!==bridge.contextKey))fail('This data directory is owned by database storage; restore/export it before switching storage.',503);
+      let canvasJobs=[];
+      if(config.storage==='database') {
+        bridge.store=await DatabaseStore.open({url:config.databaseUrl,context:bridge.contextKey});
+        if(!await bridge.store.initialized()) {
+          if(marker)throw storageError(); // Never initialize an empty replacement database over existing ownership.
+          const legacy=[];
+          for await(const entry of await opendir(config.dataDir)) {
+            if(!/^[0-9a-f-]{36}\.json$/.test(entry.name))continue;
+            if(!config.migrateLegacy)fail('Legacy jobs require an explicit database migration.',503);
+            const job=JSON.parse(await readFile(join(config.dataDir,entry.name),'utf8'));
+            if(job.id+'.json'!==entry.name || job.context!==bridge.contextKey)throw storageError();
+            legacy.push(job);
+          }
+          // Validate and reconcile the registry before committing any imported job.
+          let state=null;
+          try {state=JSON.parse(await readFile(join(config.dataDir,'canvases.json'),'utf8'));}catch(e){if(e.code!=='ENOENT')throw e;}
+          const staging={readCanvas:async()=>state,writeCanvas:async value=>{state=value;}};
+          await CanvasPool.open({context:bridge.contextKey,legacyProjectId:config.projectId,jobs:legacy,store:staging});
+          await bridge.store.initialize(legacy,state);
+        } else if(!marker) {
+          // A previous file rollback may have accepted new work. An existing
+          // DB context is NOT proof that these files were already migrated.
+          // Also covers a crash after migration commit but before marker write.
+          let compared=0;
+          for await(const entry of await opendir(config.dataDir)) {
+            if(!/^[0-9a-f-]{36}\.json$/.test(entry.name))continue;
+            const legacy=JSON.parse(await readFile(join(config.dataDir,entry.name),'utf8'));
+            if(legacy.id+'.json'!==entry.name || !isDeepStrictEqual(legacy,await bridge.store.get(legacy.id)))throw storageError();
+            compared++;
+          }
+          if(compared!==await bridge.store.count())throw storageError();
+          let registry;
+          try {registry=JSON.parse(await readFile(join(config.dataDir,'canvases.json'),'utf8'));}catch(e){if(e.code!=='ENOENT')throw e;}
+          if(registry && !isDeepStrictEqual(registry,await bridge.store.readCanvas()))throw storageError();
+        }
+        await atomicJSON(join(config.dataDir,'.database-storage.json'),{version:1,context:bridge.contextKey});
+        for(const job of await bridge.store.active())bridge.cacheJob(job);
+        bridge.storedJobs=await bridge.store.count();
+        canvasJobs=await bridge.store.canvasJobs();
+      } else {
+        await mkdir(join(config.dataDir,'keys'),{recursive:true,mode:0o700});
+        for await (const entry of await opendir(config.dataDir)) {
+          const name=entry.name;
+          if (!/^[0-9a-f-]{36}\.json$/.test(name)) continue;
+          const job = JSON.parse(await readFile(join(config.dataDir, name), 'utf8'));
+          if (!UUID.test(job.id) || name !== job.id + '.json' || job.context !== bridge.contextKey) fail('stored job context mismatch', 503);
+          await bridge.indexJob(job);bridge.cacheJob(job);bridge.storedJobs++;
+          canvasJobs.push({key:job.key,digest:job.digest,projectId:job.projectId,request:{n:job.request.n}});
+        }
       }
       bridge.canvases = await CanvasPool.open({path:join(config.dataDir,'canvases.json'),context:bridge.contextKey,
-        legacyProjectId:config.projectId,jobs:[...bridge.jobs.values()]});
+        legacyProjectId:config.projectId,jobs:canvasJobs,store:bridge.store});
       return bridge;
     } catch (error) { await bridge.close(); throw error; }
   }
 
   constructor(config, cli) {
     this.config = config;
-    this.cli = cli || (args => runCLI(config.cli, ['--format=json', '--non-interactive', '--profile=' + config.profile, '--region=' + config.region, ...args], config.commandTimeoutMs));
+    const invokeCLI = cli || (args => runCLI(config.cli, ['--format=json', '--non-interactive', '--profile=' + config.profile, '--region=' + config.region, ...args], config.commandTimeoutMs));
+    this.cli = args => {this.store?.assertHealthy();return invokeCLI(args);};
     this.contextKey = hash(JSON.stringify([config.profile, config.region, config.userId, config.space, config.projectId, config.models]));
-    this.jobs = new Map(); this.keys = new Map(); this.admissions = Promise.resolve();
+    this.jobs = new Map(); this.history = new Map(); this.storedJobs = 0; this.admissions = Promise.resolve();
     this.lastQueuedId = null; this.lastPolledId = null; this.lastDownloadedId = null;
     this.nextPoll = new Map(); this.nextDownload = new Map();
     this.catalogCheckedAt = null; this.catalogRefresh = null; this.contextCheck = null;
@@ -176,6 +228,7 @@ export class Bridge {
     this.closed = true;
     await this.admissions;
     await Promise.allSettled([...this.inFlight.values()].map(work => work.promise));
+    if (this.store) await this.store.close();
     if (this.lock) { await this.lock.close(); await unlink(join(this.config.dataDir, '.lock')).catch(e => { if (e.code !== 'ENOENT') throw e; }); }
   }
 
@@ -265,12 +318,11 @@ export class Bridge {
     if (!valid) fail('requested parameters are not available in the live CLI model specification');
   }
 
-  validate(body) {
+  validate(body, source = this.jobs.get(body?.source_job_id)) {
     if (!body || typeof body !== 'object' || Array.isArray(body)) fail('invalid request body');
     if (Object.hasOwn(VIDEO_MODELS, body.model)) {
       if (!Object.hasOwn(this.config.models, body.model)) fail('unsupported model/kind');
       if (body.mode === 'promote') {
-        const source = this.jobs.get(body.source_job_id);
         if (Object.keys(body).some(k => !['kind','model','mode','source_job_id','resolution','ratio','seconds','n','references'].includes(k)) ||
             body.model !== 'seedance_2.5' || body.kind !== 'video' || !source || source.status !== 'completed' || source.request.model !== 'seedance_2.5_draft' || source.request.n !== 1 || source.files.length !== 1 ||
             body.resolution !== '1080p' || body.seconds !== source.request.seconds || body.ratio !== source.request.ratio || body.n !== 1 || !Array.isArray(body.references) || body.references.length) fail('invalid draft promotion source or parameters');
@@ -296,21 +348,25 @@ export class Bridge {
   submit(body, key, waitForGateway = false) {
     const op = this.admissions.then(async () => {
       if (this.closed) fail('bridge closed', 503);
-      const request = this.validate(body);
+      this.store?.assertHealthy();
+      const source = body?.mode==='promote' ? await this.loadJob(body.source_job_id) : undefined;
+      const request = this.validate(body,source);
       if (typeof key !== 'string' || !/^[\x21-\x7e]{1,200}$/.test(key)) fail('invalid Idempotency-Key');
       const keyHash = hash(key), digest = hash(JSON.stringify(request));
-      const existing = this.jobs.get(this.keys.get(keyHash));
+      const existingId = await this.findJobKey(keyHash);
+      const existing = existingId ? await this.loadJob(existingId,true) : undefined;
       if (existing) {
         if (existing.digest !== digest) fail('idempotency conflict', 409);
-        return this.get(existing.id);
+        return this.get(existing.id,existing);
       }
       if (request.n > this.config.maxConcurrent) fail('requested count exceeds generation capacity', 429);
-      if (this.jobs.size >= this.config.maxJobs || [...this.jobs.values()].filter(j => !terminal(j)).reduce((n,j) => n + j.request.n, 0) + request.n > this.config.maxQueue) fail('queue/storage capacity reached', 429);
+      if ([...this.jobs.values()].filter(j => !terminal(j)).reduce((n,j) => n + j.request.n, 0) + request.n > this.config.maxQueue) fail('Active video queue is full. Please retry after existing tasks finish.', 429, 'active_queue_full');
       const job = { id: randomUUID(), key: keyHash, digest, context: this.contextKey, request,
         nodeId: 'node_' + Array.from(randomBytes(10), b => '0123456789abcdefghjkmnpqrstvwxyz'[b & 31]).join(''), updateId: randomUUID(), submitId: randomUUID(),
         status: 'queued', created_at: Math.floor(Date.now() / 1000), timings: {admitted_at_ms: Date.now()}, files: [], inputs: [] };
       // Only local file identities/hashes are persisted. In particular, signed
       // input URLs and base64 payloads never enter job snapshots or responses.
+      let saving=false;
       try {
         let remaining = this.config.maxInputBytes;
         const inputDeadline = AbortSignal.timeout(30000);
@@ -329,23 +385,25 @@ export class Bridge {
           job.projectId = reserved.projectId;
           job.canvasName = reserved.name;
         } else if (this.config.canvasTaskLimit === 5) {
-          const source = request.mode === 'promote' ? this.jobs.get(request.source_job_id) : undefined;
           const canvas = await this.canvases.reserve(job, source ? this.projectId(source) : undefined);
           job.projectId = canvas.projectId;
           job.canvasName = canvas.name;
         } else {
           // Fixed mode only affects new independent jobs. Source-bound work
           // must keep its project even when rotation has been switched off.
-          const source = request.mode === 'promote' ? this.jobs.get(request.source_job_id) : undefined;
           job.projectId = source ? this.projectId(source) : this.config.projectId;
           if (job.projectId !== this.config.projectId) await this.canvases.reserve(job, job.projectId);
         }
+        saving=true;
         await this.save(job);
       } catch(e) {
-        for (const input of job.inputs) await unlink(join(this.config.dataDir,input.filename)).catch(()=>{});
+        // A lost commit response may still mean the job was persisted. Keep
+        // its inputs until recovery establishes the authoritative DB state.
+        if(!saving)for (const input of job.inputs) await unlink(join(this.config.dataDir,input.filename)).catch(()=>{});
         throw e;
       }
-      this.jobs.set(job.id, job); this.keys.set(keyHash, job.id);
+      this.storedJobs++;
+      await this.indexJob(job);
       if (!waitForGateway) this.leases.set(job.id, Date.now() + this.config.leaseSeconds * 1000);
       return this.get(job.id);
     });
@@ -353,12 +411,75 @@ export class Bridge {
     return op;
   }
 
-  async save(job) { await atomicJSON(join(this.config.dataDir, job.id + '.json'), job); }
+  async save(job) {
+    try { if(this.store)await this.store.save(job);else await atomicJSON(join(this.config.dataDir, job.id + '.json'), job); }
+    catch { fail('Task storage is unavailable. Please contact the operator.',503,'job_storage_unavailable'); }
+    this.cacheJob(job);
+  }
+
+  cacheJob(job) {
+    this.jobs.set(job.id,job);
+    this.history.delete(job.id);
+    if(!terminal(job))return;
+    this.history.set(job.id,true);
+    this.nextPoll.delete(job.id);this.nextDownload.delete(job.id);this.leases.delete(job.id);
+    while(this.history.size>this.config.historyCacheSize) {
+      const id=this.history.keys().next().value;
+      this.history.delete(id);this.jobs.delete(id);
+    }
+  }
+
+  async loadJob(id, indexed=false) {
+    if(!UUID.test(id || ''))fail('job not found',404);
+    this.store?.assertHealthy();
+    const cached=this.jobs.get(id);
+    if(cached){this.cacheJob(cached);return cached;}
+    let job;
+    try {
+      job=this.store?await this.store.get(id):JSON.parse(await readFile(join(this.config.dataDir,id+'.json'),'utf8'));
+      if(!job)throw Object.assign(new Error('missing job'),{code:'ENOENT'});
+    }
+    catch(error) {
+      if(error.code==='ENOENT' && !indexed)fail('job not found',404);
+      fail('Task storage is unavailable. Please contact the operator.',503,'job_storage_unavailable');
+    }
+    if(job.id!==id || job.context!==this.contextKey)fail('Task storage is unavailable. Please contact the operator.',503,'job_storage_unavailable');
+    this.cacheJob(job);
+    return job;
+  }
+
+  async findJobKey(key) {
+    if(this.store)return this.store.findKey(key);
+    let record;
+    try { record=JSON.parse(await readFile(join(this.config.dataDir,'keys',key+'.json'),'utf8')); }
+    catch(error) {
+      if(error.code!=='ENOENT')fail('Task storage is unavailable. Please contact the operator.',503,'job_storage_unavailable');
+      // A job may have been durably saved before its index write failed.
+      // Recover that same identity; never create a second job for this key.
+      const saved=[...this.jobs.values()].find(j=>j.key===key);
+      if(!saved)return undefined;
+      await this.indexJob(saved);return saved.id;
+    }
+    if(record.context!==this.contextKey || record.key!==key || !UUID.test(record.id))fail('Task storage is unavailable. Please contact the operator.',503,'job_storage_unavailable');
+    return record.id;
+  }
+
+  async indexJob(job) {
+    if(this.store)return; // Unique key and job are committed in the same database transaction.
+    if(!/^[0-9a-f]{64}$/.test(job.key))fail('invalid stored job key',503,'job_storage_unavailable');
+    const path=join(this.config.dataDir,'keys',job.key+'.json');
+    try {
+      let existing;
+      try {existing=JSON.parse(await readFile(path,'utf8'));}catch(error){if(error.code!=='ENOENT')throw error;}
+      if(existing) {
+        if(existing.id!==job.id || existing.key!==job.key || existing.context!==this.contextKey)throw Error('index identity mismatch');
+      } else await atomicJSON(path,{key:job.key,id:job.id,context:this.contextKey});
+    } catch {fail('Task storage is unavailable. Please contact the operator.',503,'job_storage_unavailable');}
+  }
 
   projectId(job) { return job.projectId || this.config.projectId; }
 
-  get(id) {
-    const j = this.jobs.get(id);
+  get(id, j = this.jobs.get(id)) {
     if (!j) fail('job not found', 404);
     return { id: j.id, object: j.request.kind === 'video' ? 'video' : 'image', model: j.request.model,
       status: j.status, created_at: j.created_at, completed_at: j.completed_at,
@@ -405,8 +526,8 @@ export class Bridge {
       .replace(/((?:access_token|refresh_token|api_key|token|signature|X-Tos-Signature)=)[^\s&]+/gi, '$1[redacted]');
   }
 
-  observe(id) {
-    const result = this.get(id);
+  observe(id, job) {
+    const result = this.get(id,job);
     if (result.status === 'queued') this.leases.set(id, Date.now() + this.config.leaseSeconds * 1000);
     return result;
   }
@@ -420,6 +541,7 @@ export class Bridge {
   sign(path, expires) { return createHmac('sha256', this.config.token).update('media\n' + path + '\n' + expires).digest('hex'); }
 
   tick() {
+    if(this.store?.poisoned)return Promise.reject(storageError());
     if (this.closed) return Promise.resolve();
     if (this.schedulerError) return Promise.reject(this.schedulerError);
     const pending = [];
@@ -457,8 +579,8 @@ export class Bridge {
           this.schedulerError = error;
           throw error;
         }).finally(() => {
-          if (lane === 'poll') this.nextPoll.set(job.id, Date.now() + this.config.pollIntervalMs);
-          if (lane === 'download') this.nextDownload.set(job.id, Date.now() + this.config.pollIntervalMs);
+          if (!terminal(job) && lane === 'poll') this.nextPoll.set(job.id, Date.now() + this.config.pollIntervalMs);
+          if (!terminal(job) && lane === 'download') this.nextDownload.set(job.id, Date.now() + this.config.pollIntervalMs);
           this.inFlight.delete(job.id);
         });
         pending.push(work.promise);
@@ -480,6 +602,7 @@ export class Bridge {
     delete job.attention;
     if (job.downloadResources) return this.downloadJob(job);
     if (job.status === 'queued') {
+      const source=job.request.mode==='promote' ? await this.loadJob(job.request.source_job_id,true) : undefined;
       this.recordTime(job, 'context_checked_at_ms');
       // A context check may itself take a long time. Re-check the start window
       // immediately before any command that can authorize a charge.
@@ -502,7 +625,6 @@ export class Bridge {
           this.validateLiveVideo(job.request);
           if (job.request.mode === 'promote') {
             const details = await this.cli(['model','seedance_2.5_draft']);
-            const source = this.jobs.get(job.request.source_job_id);
             const generation = details.matches?.map(m=>m.generation).find(g=>g?.generationKind==='sample' && g.mode===source.request.mode);
             const values = generation?.draftPromotion?.params?.find(p=>p.name==='resolution')?.rule?.stringValues;
             if (!values?.includes(job.request.resolution)) fail('promotion resolution unavailable');
@@ -539,7 +661,7 @@ export class Bridge {
       // override this policy; the gateway still reserves user quota first.
       const creditApproval = this.config.unlimitedCredits ? '--yes' : '--credit-ceiling=' + m.maxCredits;
       const args = r.mode === 'promote' ? ['node','promote','video-sample','--project-id='+this.projectId(job),
-        '--node-id='+this.jobs.get(r.source_job_id).nodeId,'--submit-id='+job.submitId,'--resolution='+r.resolution,
+        '--node-id='+source.nodeId,'--submit-id='+job.submitId,'--resolution='+r.resolution,
         '--title=Video promotion',creditApproval] :
         ['node', 'create', r.kind, '--project-id=' + this.projectId(job),
         '--node-id=' + job.nodeId, '--update-id=' + job.updateId, '--submit-id=' + job.submitId,
@@ -687,7 +809,7 @@ function json(res, status, body) {
 }
 
 async function content(bridge, req, res, id, index) {
-  const job = bridge.jobs.get(id), file = job?.files[index];
+  const job = await bridge.loadJob(id), file = job?.files[index];
   if (job?.status !== 'completed' || !file) fail('content not found', 404);
   const path = join(bridge.config.dataDir, file.filename);
   const info = await stat(path);
@@ -724,7 +846,7 @@ export function createServer(bridge) {
         equal(url.searchParams.get('sig') || '', bridge.sign(url.pathname, expires));
       if (!bearer && !(signed && ['GET', 'HEAD'].includes(req.method))) fail('unauthorized', 401);
       if (media && ['GET', 'HEAD'].includes(req.method)) return await content(bridge, req, res, media[1], Number(media[2]));
-      if (req.method === 'GET' && url.pathname === '/healthz') return json(res, 200, { status: bridge.schedulerError ? 'error' : 'ok', queued: [...bridge.jobs.values()].filter(j => !terminal(j)).length,
+      if (req.method === 'GET' && url.pathname === '/healthz') return json(res, 200, { status: bridge.schedulerError || bridge.store?.poisoned ? 'error' : 'ok', storage:bridge.config.storage, stored_jobs:bridge.storedJobs, cached_history:bridge.history.size, queued: [...bridge.jobs.values()].filter(j => !terminal(j)).length,
         waiting: [...bridge.jobs.values()].filter(j => j.status === 'queued').length,
         running: [...bridge.jobs.values()].filter(j => j.status === 'in_progress').length,
         submit_workers: [...bridge.inFlight.values()].filter(w => w.lane === 'submit').length,
@@ -733,7 +855,7 @@ export function createServer(bridge) {
         downloading: [...bridge.jobs.values()].filter(j => j.status === 'in_progress' && j.downloadResources).length });
       if (req.method === 'POST' && url.pathname === '/v1/jobs') {
         if ((req.headers['content-type'] || '').split(';')[0].trim() !== 'application/json') fail('JSON required', 415);
-        if (admissions >= bridge.config.maxAdmissions) fail('submission admission capacity reached', 429);
+        if (admissions >= bridge.config.maxAdmissions) fail('Too many simultaneous submission requests. Please retry shortly.',429,'submission_admission_full');
         admissions++;
         try {
           const chunks = []; let size = 0;
@@ -744,10 +866,10 @@ export function createServer(bridge) {
         } finally { admissions--; }
       }
       const query = /^\/v1\/jobs\/([0-9a-f-]{36})$/.exec(url.pathname);
-      if (req.method === 'GET' && query) return json(res, 200, bridge.observe(query[1]));
+      if (req.method === 'GET' && query) return json(res, 200, bridge.observe(query[1],await bridge.loadJob(query[1])));
       fail('not found', 404);
     } catch (error) {
-      if (!res.headersSent) json(res, error.status || 500, { error: { message: error.status ? error.message : 'bridge internal error' } });
+      if (!res.headersSent) json(res, error.status || 500, { error: { ...(error.code ? {code:error.code} : {}), message: error.status ? error.message : 'bridge internal error' } });
       else res.destroy();
     }
   });

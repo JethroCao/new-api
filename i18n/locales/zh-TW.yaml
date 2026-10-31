@@ -92,3 +92,7 @@ channel.upstream_update_added_models: "新增模型範例（顯示 {{.Shown}}/{{
 channel.upstream_update_removed_models: "刪除模型範例（顯示 {{.Shown}}/{{.Total}}）：{{.Models}}"
 channel.upstream_update_failed_channels: "失敗管道 ID（顯示 {{.Shown}}/{{.Total}}）：{{.Ids}}"
 channel.upstream_update_more_omitted: "（其餘 {{.Count}} 個已省略）"
+
+relay.active_video_queue_full: "未完成的影片任務已達到容量上限，請等待現有任務結束後重試。"
+relay.submission_admission_full: "同時提交的請求過多，請稍後重試。"
+relay.job_storage_unavailable: "任務儲存暫不可用，請聯絡管理員。"

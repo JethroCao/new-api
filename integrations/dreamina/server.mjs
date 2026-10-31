@@ -15,7 +15,7 @@ async function stop(exitCode = 0) {
 try {
   if (!process.env.DREAMINA_BRIDGE_CONFIG) throw new Error('Set DREAMINA_BRIDGE_CONFIG to your configuration JSON path');
   const input = JSON.parse(await readFile(resolve(process.env.DREAMINA_BRIDGE_CONFIG), 'utf8'));
-  const config = validateConfig({ ...input, token: process.env.DREAMINA_BRIDGE_TOKEN });
+  const config = validateConfig({ ...input, token: process.env.DREAMINA_BRIDGE_TOKEN, databaseUrl:process.env.DREAMINA_DATABASE_URL });
   // Preflight never creates a canvas, changes space, authorizes a debit, or
   // starts a login flow. The operator prepares a dedicated CLI profile.
   const probe = new Bridge(config);

@@ -210,7 +210,7 @@ New API 内容代理另行应用全局 `fetch_setting`，渠道 Base URL 不会�
 - 每笔任务先写入稳定节点/提交 ID；上传使用预先落盘的资源 UUID，重试使用同一身份。付费提交超时后只查询原 submit ID，不自动重提。
 - HTTP 创建后须收到第一次鉴权轮询才开始执行，避免网关未保存受理结果便消耗积分。排队任务须维持轮询租约（默认 300 秒），重启不恢复租约。网关正常任务轮询会续约，无需终端用户直接访问桥接。
 - 默认最多 2 个活动生成任务（`maxConcurrent`，1–200；生产压测可显式设为 200），所有进行中任务都会查询。排队任务轮换尝试，没有租约或准备失败的任务不会长期占住队首。HTTP 默认同时最多接纳 2 笔提交（`maxAdmissions`，1–200），其余返回 429，查询及下载仍可用。
-- 默认最多 20 个未完成任务、1000 个持久任务，排队最长 1800 秒（30 分钟）；分别由 `maxQueue`（1–200，包含排队和进行中）、`maxJobs`、`maxQueueWaitSeconds` 配置。未开始且过期的任务失败，不生成。
+- 默认最多 20 个未完成视频，排队最长 1800 秒（30 分钟）；分别由 `maxQueue`（1–200，包含排队、进行中和待核查任务，按视频数量累计）、`maxQueueWaitSeconds` 配置。成功和失败历史不占接单容量，旧 `maxJobs` 配置不再限制接单。`historyCacheSize`（默认 100，1–1000）只限制内存中的完整历史缓存，不删除数据库记录。未开始且过期的任务失败，不生成。
 - New API 超时应大于排队上限加 CLI 命令超时，连续轮询失败窗口应大于租约。租约不提供跨服务原子取消：网关终止与 CLI 受理同时发生仍可能消费，已提交任务不自动取消。
 - 每次执行检查账号/空间。`context_mismatch`、`cli_unavailable`、`model_unavailable` 表示等待修复；`reference_upload_pending` 使用原 UUID 恢复上传；准备结束后再次检查租约才允许生成。
 - `submission_uncertain`、`status_unavailable`、`manual_recovery_required` 应按存储的 submitId/projectId 只读检查 `operation status`。`absent` 不能证明从未扣费，不可换 ID 重跑。
@@ -238,3 +238,19 @@ go test ./plugins
 0.2.0 的其他模型、批量、参考素材生成和样片转正片尚未逐项付费生成验收；本次仅完成开发、自动化和只读/本地 CLI 验证，没有自动启用生产渠道或进行额外扣费。正式面向用户前仍需按管理员确认的预算进行真实生成、正价计费及长时间运行验收。
 
 2026-10-30 并发修复验证：本机及生产服务器均通过 69 项桥接测试，覆盖 100 个单视频请求分配 20 个画布、6 个提交/2 个查询位隔离、重叠调度去重、批量视频容量、台账升级与停机恢复。线上 8 个共用 profile 的并行只读 CLI 检查通过。发布后沿用原任务身份恢复用户队列，不重新提交已失败或结果不确定的任务；旧台账升级到版本 2，回退必须保留支持该版本的程序和全部任务记录。
+
+
+## 数据库存储与旧文件迁移
+
+生产部署使用 `storage: "database"`，通过服务环境变量 `DREAMINA_DATABASE_URL` 指向现有数据库。支持 PostgreSQL URL、MySQL URL 和 `sqlite:///absolute/path/jobs.sqlite`；SQLite 需要 Node 22.13+。先在适配层目录运行 `npm ci --omit=dev --ignore-scripts`。数据库凭证仅放权限受限的环境文件，不写配置 JSON 或日志；PostgreSQL 保留 `sslmode=verify-full` 和可信 CA 设置。
+
+适配层独立使用 `dreamina_bridge_jobs`、`dreamina_bridge_contexts` 两张表，任务 JSON、上游/提交/节点 ID、唯一幂等键以及画布分配都在数据库中。视频与参考素材仍在 `dataDir`。启动只加载未结束任务；历史查询按 ID 读取。一个持久数据库会话持有独占锁，连接失效后停止接单与提交，必须重启恢复，不能悄悄切回文件。
+
+旧安装默认保持 `storage: "file"` 以兼容配置；正式迁移步骤：
+
+1. 停止服务并等待 CLI 工作退出，确认 `.lock` 已释放。备份原配置、环境文件、任务 JSON 和 `canvases.json`。
+2. 配置数据库环境变量及 `storage: "database"`。离线运行 `node storage-admin.mjs migrate`；它不调用 CLI、不生成视频。首次导入在同一事务中完成，核对全部旧任务字段和媒体文件。
+3. 检查输出数量与备份一致，再启动服务。首次迁移后数据库成为唯一权威来源，重复启动不会重新导入旧 JSON；`.database-storage.json` 防止误切回旧文件。
+4. 如需回滚存储，先停服务，运行 `node storage-admin.mjs export /new/empty/export-directory`。该命令导出数据库的最新任务和画布元数据，媒体原地保留。核对导出数量后替换文件元数据并切换配置；不得直接使用迁移前的旧 JSON，否则可能丢失新任务或重复提交。删除归属标记前必须完成核对。
+
+`active_queue_full` 表示未结束视频容量已满；`submission_admission_full` 表示同时提交的 HTTP 请求过多；`job_storage_unavailable` 表示数据库或持久化不可用（503）。这三者与历史记录数量无关。数据库记录不自动删除，保留策略另行配置。
