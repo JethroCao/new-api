@@ -1,0 +1,129 @@
+{
+  "schema_version": 1,
+  "policy_version": "standard-credit-70-2026-11-07",
+  "scope": "Normal/default group baseline; plugin model overrides also use the host group ratio for other groups. Kemeng pricing is excluded and this artifact must not enable a Kemeng cost group",
+  "currency": "CNY",
+  "quota_per_currency_unit": 500000,
+  "group_ratio": 1,
+  "provenance": {
+    "baseline_date": "2026-10-29",
+    "baseline_archive": "dreamina-pricing-70-20261029/plan.json",
+    "baseline": "Archived no-video-input output-second benchmark at 70%; not newly verified official prices",
+    "credits_date": "2026-11-05",
+    "credits_source": "Canvas CLI 1.2.0 quote-only survey; not ledger deductions",
+    "sources": [
+      "https://docs.volcengine.com/docs/ark/model-pricing?lang=zh",
+      "https://docs.volcengine.com/docs/ark/create-video-generation-task-api?lang=zh",
+      "https://help.aliyun.com/zh/model-studio/model-pricing",
+      "https://help.aliyun.com/zh/model-studio/wan3-0-video"
+    ]
+  },
+  "settlement": "Estimate credits for reservation; original accepted batch quote credits times delivered/n at the frozen model-resolution price per credit",
+  "prices": {
+    "seedance_2.5": {
+      "480p": {
+        "baseline_cny_per_output_second": 0.469,
+        "no_reference_credits_per_output_second": 12,
+        "cny_per_credit": 0.03908333333333333
+      },
+      "720p": {
+        "baseline_cny_per_output_second": 1.057,
+        "no_reference_credits_per_output_second": 20,
+        "cny_per_credit": 0.052849999999999994
+      },
+      "1080p": {
+        "baseline_cny_per_output_second": 2.618,
+        "no_reference_credits_per_output_second": 64,
+        "cny_per_credit": 0.04090625
+      }
+    },
+    "seedance_2.5_draft": {
+      "480p": {
+        "baseline_cny_per_output_second": 0.469,
+        "no_reference_credits_per_output_second": 9,
+        "cny_per_credit": 0.05211111111111111
+      }
+    },
+    "seedance_2.0_vip": {
+      "720p": {
+        "baseline_cny_per_output_second": 0.693,
+        "no_reference_credits_per_output_second": 14,
+        "cny_per_credit": 0.049499999999999995
+      },
+      "1080p": {
+        "baseline_cny_per_output_second": 1.736,
+        "no_reference_credits_per_output_second": 33,
+        "cny_per_credit": 0.05260606060606061
+      },
+      "4k": {
+        "baseline_cny_per_output_second": 3.535,
+        "no_reference_credits_per_output_second": 80,
+        "cny_per_credit": 0.044187500000000005
+      }
+    },
+    "seedance_2.0_fast_vip": {
+      "720p": {
+        "baseline_cny_per_output_second": 0.56,
+        "no_reference_credits_per_output_second": 6,
+        "cny_per_credit": 0.09333333333333334
+      }
+    },
+    "seedance_2.0_mini": {
+      "720p": {
+        "baseline_cny_per_output_second": 0.35,
+        "no_reference_credits_per_output_second": 6,
+        "cny_per_credit": 0.05833333333333333
+      }
+    },
+    "seedance_pro_fast": {
+      "720p": {
+        "baseline_cny_per_output_second": 0.06054048,
+        "no_reference_credits_per_output_second": 2,
+        "cny_per_credit": 0.03027024
+      },
+      "1080p": {
+        "baseline_cny_per_output_second": 0.1439424,
+        "no_reference_credits_per_output_second": 4,
+        "cny_per_credit": 0.0359856
+      }
+    },
+    "happyhorse_1.1": {
+      "720p": {
+        "baseline_cny_per_output_second": 0.63,
+        "no_reference_credits_per_output_second": 14,
+        "cny_per_credit": 0.045
+      },
+      "1080p": {
+        "baseline_cny_per_output_second": 0.84,
+        "no_reference_credits_per_output_second": 18,
+        "cny_per_credit": 0.04666666666666666
+      }
+    },
+    "wan_3.0": {
+      "720p": {
+        "baseline_cny_per_output_second": 0.42,
+        "no_reference_credits_per_output_second": 14,
+        "cny_per_credit": 0.03
+      },
+      "1080p": {
+        "baseline_cny_per_output_second": 0.84,
+        "no_reference_credits_per_output_second": 33,
+        "cny_per_credit": 0.025454545454545452
+      }
+    }
+  },
+  "aliases": {
+    "dreamina-video": "seedance_2.5"
+  },
+  "billing_setting.plugin_billing_expr": {
+    "dreamina-cli::seedance_2.5": "v1:u(\"resolution\") == \"480p\" ? tier(\"480p\", u(\"credits\") * 0.03908333333333333) : u(\"resolution\") == \"720p\" ? tier(\"720p\", u(\"credits\") * 0.052849999999999994) : tier(\"1080p\", u(\"credits\") * 0.04090625)",
+    "dreamina-cli::seedance_2.5_draft": "v1:tier(\"480p\", u(\"credits\") * 0.05211111111111111)",
+    "dreamina-cli::seedance_2.0_vip": "v1:u(\"resolution\") == \"720p\" ? tier(\"720p\", u(\"credits\") * 0.049499999999999995) : u(\"resolution\") == \"1080p\" ? tier(\"1080p\", u(\"credits\") * 0.05260606060606061) : tier(\"4k\", u(\"credits\") * 0.044187500000000005)",
+    "dreamina-cli::seedance_2.0_fast_vip": "v1:tier(\"720p\", u(\"credits\") * 0.09333333333333334)",
+    "dreamina-cli::seedance_2.0_mini": "v1:tier(\"720p\", u(\"credits\") * 0.05833333333333333)",
+    "dreamina-cli::seedance_pro_fast": "v1:u(\"resolution\") == \"720p\" ? tier(\"720p\", u(\"credits\") * 0.03027024) : tier(\"1080p\", u(\"credits\") * 0.0359856)",
+    "dreamina-cli::happyhorse_1.1": "v1:u(\"resolution\") == \"720p\" ? tier(\"720p\", u(\"credits\") * 0.045) : tier(\"1080p\", u(\"credits\") * 0.04666666666666666)",
+    "dreamina-cli::wan_3.0": "v1:u(\"resolution\") == \"720p\" ? tier(\"720p\", u(\"credits\") * 0.03) : tier(\"1080p\", u(\"credits\") * 0.025454545454545452)",
+    "dreamina-cli::dreamina-video": "v1:u(\"resolution\") == \"480p\" ? tier(\"480p\", u(\"credits\") * 0.03908333333333333) : u(\"resolution\") == \"720p\" ? tier(\"720p\", u(\"credits\") * 0.052849999999999994) : tier(\"1080p\", u(\"credits\") * 0.04090625)"
+  }
+}

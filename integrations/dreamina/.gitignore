@@ -1,0 +1,6 @@
+config.local.json
+data/
+.env
+node_modules/
+reservations.local.json
+*.release.js
