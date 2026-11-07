@@ -4,7 +4,7 @@ import {resolve} from 'node:path';
 
 // The reviewed official baseline. Change only when intentionally rebasing the
 // additive branch onto a newly reviewed official commit.
-export const OFFICIAL_BASELINE = '706144769e5bed5a47b78721e3bb11da3cf4c0b9';
+export const OFFICIAL_BASELINE = '9c2c370a6156b3ac41874231952a938891ac5483';
 const PREFIXES = ['integrations/dreamina/', 'plugins/tasks/dreamina-cli/'];
 
 export function verifyAdditive(root, baseline = OFFICIAL_BASELINE) {

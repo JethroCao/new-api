@@ -1,6 +1,6 @@
 # Dreamina CLI integration for an unchanged New API host
 
-This integration targets official commit `706144769e5bed5a47b78721e3bb11da3cf4c0b9`. All integration files are additions under this directory. No official Go code, dependency files, database models, frontend files, or existing plugin files are modified.
+This integration targets official commit `9c2c370a6156b3ac41874231952a938891ac5483`. All integration files are additions under this directory. No official Go code, dependency files, database models, frontend files, or existing plugin files are modified.
 
 ## Components and installation
 
