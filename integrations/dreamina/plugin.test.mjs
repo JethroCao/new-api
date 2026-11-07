@@ -60,15 +60,21 @@ test('multiple results have authenticated host artifacts without exposing bridge
   assert.equal(rendered.video_count,3); assert.equal(JSON.stringify(rendered).includes('private'),false);
 });
 
-test('draft promotion uses only an owner-verified origin task and inherits its immutable parameters', () => {
-  const intent=decode({model:'seedance_2.5',mode:'promote',draft_task_id:'task_draft',resolution:'1080p'});
-  assert.deepEqual(intent.originTaskIds,['task_draft']);
-  assert.throws(()=>p.buildSubmitRequest(driver(intent)));
-  const ctx={...driver(intent),originTasks:[{taskId:'task_draft',upstreamTaskId:'bridge-draft',status:'SUCCESS',data:{model:'seedance_2.5_draft',object:'video',video_count:1,n:1,seconds:12,ratio:'9:16'}}]};
-  const r=p.buildSubmitRequest(ctx);
-  assert.equal(r.body.source_job_id,'bridge-draft'); assert.equal(r.body.seconds,12); assert.equal(r.body.ratio,'9:16');
-  assert.equal(p.extractUsage(ctx).seconds,12);
-  assert.throws(()=>decode({mode:'promote',draft_task_id:'task_draft',seconds:30}));
+test('new promotions are clearly rejected before usage or upstream request construction', () => {
+  const message={message:'暂不支持样片转正，请直接创建普通视频任务'};
+  for (const requestBody of [{mode:'promote'}, {draft_task_id:'task_draft'}, {source_job_id:'bridge-draft'}, {mode:'promote',draft_task_id:'task_draft',resolution:'1080p'}]) {
+    assert.throws(()=>decode(requestBody),message);
+    assert.throws(()=>decode({}, {body:{kind:'multipart',fields:Object.fromEntries(Object.entries(requestBody).map(([key,value])=>[key,[value]])),files:[]}}),message);
+    const ctx=driver({model:'seedance_2.5',requestBody});
+    assert.throws(()=>p.extractUsage(ctx),message);
+    assert.throws(()=>p.buildSubmitRequest(ctx),message);
+  }
+  const actionOnly=driver({model:'seedance_2.5',action:'promote',requestBody:{prompt:'waves'}});
+  assert.throws(()=>p.extractUsage(actionOnly),message);
+  assert.throws(()=>p.buildSubmitRequest(actionOnly),message);
+  const draft=driver(decode({model:'seedance_2.5_draft',prompt:'waves'}));
+  assert.equal(p.buildSubmitRequest(draft).body.model,'seedance_2.5_draft');
+  assert.equal(p.extractUsage(draft).seconds,5);
 });
 
 test('query errors remain unknown and old image tasks cannot be created', () => {

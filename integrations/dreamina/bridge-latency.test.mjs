@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {mkdtemp,rm,readFile,writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {createHash} from 'node:crypto';
+import {createHash,randomUUID} from 'node:crypto';
 import {Bridge,validateConfig,createServer} from './bridge.mjs';
 import {quotedCLI} from './fixtures/quote-cli.mjs';
 import * as plugin from './plugin.js';
@@ -727,7 +727,7 @@ test('missing promotion quotes recover only from the original operation or expir
   const previousUtils=globalThis.utils;
   globalThis.utils={base64URLDecode:value=>Buffer.from(value,'base64url').toString('utf8')};
   t.after(()=>{globalThis.utils=previousUtils;});
-  const creditPlugin=await import('data:text/javascript;base64,'+Buffer.from(await buildCreditPlugin({models:['seedance_2.5','seedance_2.5_draft'],promotionReservationCreditsPerVideo:100})).toString('base64'));
+  const creditPlugin=await import('data:text/javascript;base64,'+Buffer.from(await buildCreditPlugin({models:['seedance_2.5','seedance_2.5_draft']})).toString('base64'));
   for(const recover of [false,true])await t.test(recover?'original quote recovered':'quote unavailable until deadline',async t=>{
     t.mock.timers.enable({apis:['Date'],now:100000000});let reads=0;
     const {bridge,calls}=await fixture(t,{canvasTaskLimit:0},async args=>{
@@ -737,11 +737,17 @@ test('missing promotion quotes recover only from the original operation or expir
       const path=flag(args,'output');await writeFile(path,mp4);return {resourceId:args[2],path,size:mp4.length,sha256:createHash('sha256').update(mp4).digest('hex')};
     });
     const source=bridge.jobs.get((await bridge.submit({...request,model:'seedance_2.5_draft'},'promotion-draft')).id);
-    source.status='completed';source.files=[{resourceId:'draft'}];
-    const key='quote-recovery';const job=bridge.jobs.get((await bridge.submit({kind:'video',model:'seedance_2.5',mode:'promote',source_job_id:source.id,resolution:'1080p',ratio:source.request.ratio,seconds:5,n:1,references:[]},key,false,{version:1,request_id:key,reserved_credits:100})).id);
-    const driver={publicTaskId:key,model:'seedance_2.5',requestBody:{mode:'promote',draft_task_id:'task_draft'},originTasks:[{taskId:'task_draft',upstreamTaskId:source.id,status:'SUCCESS',data:{model:'seedance_2.5_draft',video_count:1,n:1,seconds:5,ratio:'16:9'}}]};
-    const ack=bridge.get(job.id),submitted=creditPlugin.parseSubmitResponse(driver,{body:ack});
-    const poll={taskId:job.id,publicTaskId:key,state:submitted.state,data:ack};
+    source.status='completed';source.files=[{resourceId:'draft'}];await bridge.save(source);
+    const key='quote-recovery',id=randomUUID(),billing={version:1,request_id:key,reserved_credits:100};
+    const job={...source,id,key:createHash('sha256').update(key).digest('hex'),
+      request:{kind:'video',model:'seedance_2.5',mode:'promote',source_job_id:source.id,resolution:'1080p',ratio:source.request.ratio,seconds:5,n:1,references:[]},
+      billing,billingMode:'credits',nodeId:'node_0000000002',updateId:randomUUID(),submitId:randomUUID(),status:'queued',files:[],inputs:[]};
+    job.digest=createHash('sha256').update(JSON.stringify({request:job.request,billing})).digest('hex');
+    await bridge.save(job);await bridge.indexJob(job);bridge.storedJobs++;await bridge.observe(job.id);
+    // This frozen plugin state was created by the old release. New submission
+    // rejects promotion, but must still settle this durable version-1 contract.
+    const poll={taskId:job.id,publicTaskId:key,data:bridge.get(job.id),state:{billingReceipt:billing,
+      billing:{...billing,job_id:job.id,model:'seedance_2.5',seconds:5,n:1,mode:'promote',resolution:'1080p',ratio:'16:9'}}};
     await bridge.processJob(job);await bridge.processJob(job);await bridge.processJob(job);
     if(recover){
       await bridge.processJob(job);

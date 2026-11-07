@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {mkdtemp,rm,readFile,writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {createHash} from 'node:crypto';
+import {createHash,randomUUID} from 'node:crypto';
 import {Bridge,validateConfig} from './bridge.mjs';
 import {quotedCLI} from './fixtures/quote-cli.mjs';
 
@@ -80,17 +80,29 @@ test('legacy in-progress jobs keep their original canvas when rotation is enable
   assert.equal(calls.some(a=>a[0]==='canvas'),false);
 });
 
-test('promotion is pinned to the source and full canvases reject before remote mutation',async t=>{
-  const {bridge,calls}=await fixture(t);
+test('historical promotion stays on its full source canvas while new promotion is rejected',async t=>{
+  const {bridge,cfg,cli,calls}=await fixture(t);
   const first=await bridge.submit({...request,model:'seedance_2.5_draft'},'draft');
   const source=bridge.jobs.get(first.id);source.status='completed';source.files=[{resourceId:'draft'}];await bridge.save(source);
   const promote={kind:'video',model:'seedance_2.5',mode:'promote',source_job_id:first.id,resolution:'1080p',ratio:source.request.ratio,seconds:5,n:1,references:[]};
   for(let i=0;i<3;i++)await bridge.submit(request,'fill-'+i);
-  const fifth=await bridge.submit(promote,'promote-1');
-  assert.equal(bridge.jobs.get(fifth.id).projectId,source.projectId);
+  const id=randomUUID();
+  const fifth={...source,id,key:createHash('sha256').update(id).digest('hex'),digest:createHash('sha256').update(JSON.stringify(promote)).digest('hex'),
+    request:promote,nodeId:'node_0000000002',updateId:randomUUID(),submitId:randomUUID(),status:'in_progress',files:[],inputs:[]};
+  // Recreate the reservation and record written before promotion was disabled.
+  await bridge.canvases.reserve(fifth,source.projectId);await bridge.save(fifth);await bridge.indexJob(fifth);bridge.storedJobs++;
+  assert.equal(fifth.projectId,source.projectId);
   const count=calls.length;
-  await assert.rejects(bridge.submit(promote,'promote-2'),/source canvas capacity reached/);
-  assert.equal(calls.length,count);assert.equal((await bridge.submit(promote,'promote-1')).id,fifth.id);
+  await assert.rejects(bridge.submit(promote,'promote-2'),{status:400,code:'promotion_not_supported'});
+  assert.equal(calls.length,count);
+  await bridge.close();calls.length=0;
+  const restored=await Bridge.open(cfg,cli);t.after(()=>restored.close());
+  await restored.processJob(restored.jobs.get(fifth.id));await restored.processJob(restored.jobs.get(fifth.id));
+  assert.equal(restored.get(fifth.id).status,'completed');
+  const work=calls.filter(args=>['operation','resource'].includes(args[0]));
+  assert.deepEqual(work.map(args=>args.slice(0,2)),[['operation','status'],['resource','download']]);
+  assert.ok(work.every(args=>flag(args,'project-id')===source.projectId));
+  assert.equal(calls.some(args=>args[0]==='canvas'||args[0]==='node'),false);
 });
 
 test('canvas create failure cannot dispatch or fall back and resumes the same project ID',async t=>{

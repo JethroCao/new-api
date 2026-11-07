@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { Bridge, validateConfig, runCLI, createServer } from './bridge.mjs';
 import { quotedCLI } from './fixtures/quote-cli.mjs';
 
@@ -43,6 +43,30 @@ test('reject invalid/unbounded requests before any CLI mutation', async t => {
     await assert.rejects(bridge.submit({ ...request, ...change }, 'invalid-' + index), /invalid|unsupported/);
   }
   await assert.rejects(bridge.submit(request, ''), /idempotency/i);
+});
+
+test('HTTP rejects every new promotion form before task lookup, persistence or CLI work', async t => {
+  let calls = 0;
+  const { bridge, cfg } = await fixture(t, async () => { calls++; throw new Error('CLI must not be called'); });
+  bridge.loadJob = async () => { throw new Error('promotion source must not be loaded'); };
+  bridge.save = async () => { throw new Error('promotion task must not be saved'); };
+  bridge.canvases.reserve = async () => { throw new Error('promotion canvas must not be reserved'); };
+  const server = createServer(bridge);
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }));
+  cfg.publicUrl = 'http://127.0.0.1:' + server.address().port;
+  const variants = [{mode:'promote'}, {source_job_id:'missing'}, {draft_task_id:'task_old'}, {source_job_id:null}, {draft_task_id:''}];
+  for (const [index, fields] of variants.entries()) {
+    const response = await fetch(cfg.publicUrl + '/v1/jobs', {
+      method:'POST', headers:{Authorization:'Bearer ' + token, 'Content-Type':'application/json', 'Idempotency-Key':'promotion-' + index},
+      body:JSON.stringify({kind:'video',model:'seedance_2.5',...fields}),
+    });
+    assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), {error:{code:'promotion_not_supported',message:'暂不支持样片转正，请直接创建普通视频任务'}});
+  }
+  assert.equal(bridge.jobs.size, 0);
+  assert.equal(bridge.storedJobs, 0);
+  assert.equal(calls, 0);
 });
 
 test('simultaneous duplicate submissions survive restart and conflicting payload is rejected', async t => {
@@ -283,6 +307,33 @@ async function videoFixture(t, handler, overrides = {}) {
   return {bridge,cfg,cli,dir};
 }
 
+// Snapshots admitted by a previous bridge version remain valid after new
+// promotion submission is disabled. Do not create them through today's API.
+async function persistLegacyPromotion(bridge, seconds = 5, billing) {
+  const sourceId = randomUUID(), jobId = randomUUID();
+  const source = {
+    id:sourceId,key:createHash('sha256').update(sourceId).digest('hex'),context:bridge.contextKey,
+    request:{kind:'video',model:'seedance_2.5_draft',mode:'t2v',prompt:'waves',ratio:'16:9',resolution:'480P',seconds,n:1,references:[]},
+    nodeId:'node_0000000001',projectId:bridge.config.projectId,status:'completed',created_at:Math.floor(Date.now()/1000),
+    files:[{resourceId:'draft-result'}],inputs:[],
+  };
+  const job = {
+    id:jobId,key:createHash('sha256').update(jobId).digest('hex'),context:bridge.contextKey,
+    request:{kind:'video',model:'seedance_2.5',mode:'promote',source_job_id:source.id,resolution:'1080p',ratio:'16:9',seconds,n:1,references:[]},
+    nodeId:'node_0000000002',projectId:source.projectId,updateId:randomUUID(),submitId:randomUUID(),
+    status:'queued',created_at:Math.floor(Date.now()/1000),timings:{admitted_at_ms:Date.now()},files:[],inputs:[],
+    ...(billing ? {billing,billingMode:'credits'} : {billingMode:'legacy_seconds'}),
+  };
+  for (const record of [source,job]) {
+    record.digest=createHash('sha256').update(JSON.stringify(record.billing?{request:record.request,billing:record.billing}:record.request)).digest('hex');
+    await bridge.save(record);
+    await bridge.indexJob(record);
+    bridge.storedJobs++;
+  }
+  await bridge.observe(job.id);
+  return {source,job};
+}
+
 test('30-minute queue window allows late starts, expires waiting work, and preserves running jobs', async t => {
   t.mock.timers.enable({ apis: ['Date'], now: new Date('2026-01-01T00:00:00Z') });
   let generations = 0;
@@ -311,7 +362,7 @@ test('unlimited credit approval must be an explicit server boolean', () => {
   }
 });
 
-test('integrated promotion preserves the operator credit cap and unlimited policy', async t => {
+test('persisted historical promotion preserves the operator credit cap and unlimited policy', async t => {
   for (const unlimitedCredits of [false, true]) {
       await t.test(unlimitedCredits ? 'unlimited' : 'capped', async t => {
         const {bridge} = await videoFixture(t, async args => {
@@ -324,12 +375,7 @@ test('integrated promotion preserves the operator credit cap and unlimited polic
           assert.equal(args.some(a => a.startsWith('--credit-ceiling=')), false);
           return {submitId: args.find(a => a.startsWith('--submit-id=')).slice(12), state: 'accepted'};
         }, {unlimitedCredits});
-        const source = await bridge.submit({kind:'video',model:'seedance_2.5_draft',prompt:'waves',seconds:10}, 'source');
-        const draft = bridge.jobs.get(source.id);
-        draft.status = 'completed'; draft.files = [{resourceId:'draft-result'}];
-        const body = {kind:'video', model:'seedance_2.5', mode:'promote', source_job_id:source.id, resolution:'1080p', ratio:'16:9', seconds:10, n:1, references:[]};
-        await assert.rejects(bridge.submit({...body, unlimitedCredits:true}, 'client-override'));
-        const job = await bridge.submit(body, 'credit-policy');
+        const {job} = await persistLegacyPromotion(bridge, 10);
         await bridge.tick();
         assert.equal(bridge.get(job.id).status, unlimitedCredits ? 'in_progress' : 'failed');
         assert.equal(bridge.get(job.id).error?.code, unlimitedCredits ? undefined : 'credit_approval_required');
@@ -417,16 +463,17 @@ test('reference URLs cannot fetch local services and invalid media fails before 
   assert.equal(paid,0);
 });
 
-test('promotion resolves a local completed draft and never accepts arbitrary CLI resource IDs',async t=>{
+test('persisted historical promotion resumes on its original draft after restart',async t=>{
   let args;
-  const {bridge}=await videoFixture(t,async a=>{args=a;return {submission:{state:'accepted'}};});
-  const source=await bridge.submit({kind:'video',model:'seedance_2.5_draft',prompt:'x',seconds:12},'draft');
-  const saved=bridge.jobs.get(source.id);saved.status='completed';saved.files=[{resourceId:'draft-result'}];
-  const j=await bridge.submit({kind:'video',model:'seedance_2.5',mode:'promote',source_job_id:source.id,resolution:'1080p',ratio:'16:9',seconds:12,n:1,references:[]},'promote');
-  await bridge.tick();assert.deepEqual(args.slice(0,3),['node','promote','video-sample']);
-  assert.ok(args.includes('--node-id='+saved.nodeId));assert.ok(args.includes('--submit-id='+bridge.jobs.get(j.id).submitId));
-  assert.equal(bridge.get(source.id).warning.includes('7'),true);
-  await assert.rejects(bridge.submit({kind:'video',model:'seedance_2.5',mode:'promote',source_job_id:'unknown'},'bad-source'));
+  const {bridge,cfg,cli}=await videoFixture(t,async a=>{args=a;return {submitId:a.find(value=>value.startsWith('--submit-id=')).slice(12),state:'accepted'};});
+  const {source,job}=await persistLegacyPromotion(bridge,12);
+  await bridge.close();
+  const restored=await Bridge.open(cfg,cli);t.after(()=>restored.close());await restored.preflight();
+  await restored.observe(job.id);await restored.tick();
+  assert.deepEqual(args.slice(0,3),['node','promote','video-sample']);
+  assert.ok(args.includes('--node-id='+source.nodeId));assert.ok(args.includes('--submit-id='+job.submitId));
+  assert.equal(restored.get(job.id).status,'in_progress');
+  assert.match(restored.get(source.id).warning,/样片最长存储 7 天.*暂不支持样片转正/);
 });
 
 test('reference DNS checks every answer including mixed public/private addresses', async()=>{
@@ -451,9 +498,9 @@ test('long reference upload cannot bypass gateway lease or cause a paid submissi
   await bridge.tick();assert.equal(paid,0);assert.equal(bridge.get(j.id).status,'queued');
 });
 
-test('promotion uses its own accepted result identity when validating subsequent outputs',async t=>{
+test('historical promotion validates its accepted result and remains downloadable after restart',async t=>{
   let resource='foreign';
-  const {bridge}=await videoFixture(t,async a=>{
+  const {bridge,cfg,cli}=await videoFixture(t,async a=>{
     if(a[0]==='node')return {submitId:a.find(x=>x.startsWith('--submit-id=')).slice(12),state:'accepted',errorCode:0,resourceIds:['promoted']};
     if(a[0]==='operation')return {operationRef:a[2],state:'completed',resources:[{resourceId:resource,state:'succeeded'}]};
     if(a[0]==='resource'){
@@ -462,9 +509,7 @@ test('promotion uses its own accepted result identity when validating subsequent
     }
     throw new Error('unexpected');
   });
-  const source=await bridge.submit({kind:'video',model:'seedance_2.5_draft',prompt:'x'},'draft-envelope');
-  const draft=bridge.jobs.get(source.id);draft.status='completed';draft.files=[{resourceId:'draft'}];
-  const j=await bridge.submit({kind:'video',model:'seedance_2.5',mode:'promote',source_job_id:source.id,resolution:'1080p',ratio:'16:9',seconds:5,n:1,references:[]},'promotion-envelope');
+  const {job:j}=await persistLegacyPromotion(bridge);
   await bridge.tick();assert.equal(bridge.get(j.id).attention,undefined);
   const promoted=bridge.jobs.get(j.id);
   await bridge.processJob(promoted);
@@ -472,6 +517,43 @@ test('promotion uses its own accepted result identity when validating subsequent
   resource='promoted';await bridge.processJob(promoted);await bridge.processJob(promoted);
   assert.equal(bridge.get(j.id).status,'completed');
   assert.deepEqual(promoted.files.map(f=>f.resourceId),['promoted']);
+  await bridge.close();
+  const restored=await Bridge.open(cfg,cli);t.after(()=>restored.close());
+  const server=createServer(restored);
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  t.after(()=>new Promise(resolve=>{server.closeAllConnections();server.close(resolve);}));
+  cfg.publicUrl='http://127.0.0.1:'+server.address().port;
+  const response=await fetch(cfg.publicUrl+'/v1/jobs/'+j.id,{headers:{Authorization:'Bearer '+token}});
+  assert.equal(response.status,200);
+  const result=await response.json();
+  assert.equal(result.status,'completed');
+  assert.equal(result.billing_mode,'legacy_seconds');
+  assert.equal(result.video_count,1);
+  assert.equal(result.seconds,5);
+  const media=await fetch(restored.mediaURL(j.id,0));
+  assert.equal(media.status,200);
+  assert.equal(media.headers.get('content-type'),'video/mp4');
+  assert.deepEqual(Buffer.from(await media.arrayBuffer()),mp4);
+});
+
+test('historical accepted promotion failure preserves the upstream error without resubmitting',async t=>{
+  let polls=0;
+  const {bridge,cfg,cli}=await videoFixture(t,async args=>{
+    assert.equal(args[0],'operation');polls++;
+    return {operationRef:args[2],state:'failed',errorCode:20115,resources:[]};
+  });
+  const {job}=await persistLegacyPromotion(bridge);
+  job.status='in_progress';
+  job.timings.accepted_at_ms=Date.now();
+  await bridge.save(job);await bridge.close();
+  const restored=await Bridge.open(cfg,cli);t.after(()=>restored.close());
+  await restored.tick();
+  const result=restored.get(job.id);
+  assert.equal(result.status,'failed');
+  assert.equal(result.error.upstream_code,20115);
+  assert.match(result.error.message,/本次生成的输出视频未通过版权审核/);
+  assert.equal(result.billing_mode,'legacy_seconds');
+  assert.equal(polls,1);
 });
 
 for (const limit of [2, 200]) test('HTTP admission limit '+limit+' bounds submissions while queries remain available',async t=>{

@@ -12,8 +12,9 @@ export const VIDEO_MODELS = {
   'wan_3.0': { resolutions: ['720P', '1080P'], minSeconds: 4, maxSeconds: 15, promptLimit: 20000, ratios: ['16:9', '4:3', '1:1', '3:4', '9:16'], frames: 2, references: { total: 20, image: 10, video: 5, audio: 5 }, requireVisual: true },
 };
 const MAX_INPUT_BYTES = 64 * 1024 * 1024;
+export const PROMOTION_UNSUPPORTED = '暂不支持样片转正，请直接创建普通视频任务';
 export const meta = {
-  apiVersion: 1, key: 'dreamina-cli', name: 'Dreamina CLI Video', icon: 'text:即梦', version: '0.3.0',
+  apiVersion: 1, key: 'dreamina-cli', name: 'Dreamina CLI Video', icon: 'text:即梦', version: '0.3.1',
   'author': { name: 'JethroCao' },
   'description': { en: 'Video generation through the official Dreamina Canvas CLI', zh: '通过官方即梦画布 CLI 生成视频' },
   'models': Object.keys(VIDEO_MODELS).concat(['dreamina-video']),
@@ -21,6 +22,7 @@ export const meta = {
   usageSchema: {
     seconds: { type: 'number', unit: 'second', description: { en: 'Video generation unit price', zh: '视频生成单价' } },
     resolution: { enum: ['480p', '720p', '1080p', '4k'], description: { en: 'Output video resolution', zh: '输出视频分辨率' } },
+    // Preserve promote as a historical pricing fact, not a creation capability.
     mode: { enum: ['t2v', 'first_last_frame', 'm2v', 'promote'], description: { en: 'Video generation mode', zh: '视频生成模式' } },
     reference_video: { type: 'boolean', description: { en: 'Reference video present', zh: '存在参考视频' } },
   },
@@ -38,19 +40,13 @@ export function canonicalModel(model) { return model === 'dreamina-video' ? 'see
 
 export function normalizeVideo(req, model, allowFileRefs) {
   if (!object(req)) throw new Error('JSON object required');
+  if (req.mode === 'promote' || req.draft_task_id !== undefined || req.source_job_id !== undefined) throw new Error(PROMOTION_UNSUPPORTED);
   model = canonicalModel(model);
   if (!has(VIDEO_MODELS, model)) throw new Error('Unsupported video model');
   const spec = VIDEO_MODELS[model];
-  const allowed = ['model', 'kind', 'prompt', 'seconds', 'n', 'ratio', 'resolution', 'size', 'mode', 'references', 'input_reference', 'draft_task_id'];
+  const allowed = ['model', 'kind', 'prompt', 'seconds', 'n', 'ratio', 'resolution', 'size', 'mode', 'references', 'input_reference'];
   for (const key of Object.keys(req)) if (allowed.indexOf(key) < 0) throw new Error('Unsupported field: ' + key);
   if (req.kind !== undefined && req.kind !== 'video') throw new Error('Media kind mismatch');
-  if (req.mode === 'promote') {
-    for (const key of Object.keys(req)) if (['model', 'kind', 'mode', 'draft_task_id', 'resolution'].indexOf(key) < 0) throw new Error('Promotion inherits all generation parameters from the draft');
-    if (model !== 'seedance_2.5' || typeof req.draft_task_id !== 'string' || !/^task_[A-Za-z0-9_-]{1,128}$/.test(req.draft_task_id)) throw new Error('Promotion requires a public draft task ID and seedance_2.5');
-    if (req.resolution !== undefined && String(req.resolution).toLowerCase() !== '1080p') throw new Error('Draft promotion supports 1080p');
-    return { kind: 'video', model: model, mode: 'promote', draft_task_id: req.draft_task_id, resolution: '1080p' };
-  }
-  if (req.draft_task_id !== undefined) throw new Error('draft_task_id requires promote mode');
   const refs = req.references === undefined ? [] : req.references;
   if (!Array.isArray(refs) || refs.length > 50) throw new Error('references must be an array with at most 50 items');
   if (req.input_reference !== undefined && refs.length) throw new Error('Use either input_reference or references');
@@ -120,20 +116,12 @@ function decode(ctx) {
     }
   } else throw new Error('JSON or multipart body required');
   const normalized = normalizeVideo(req, ctx.upstreamModel || ctx.model, body.kind === 'multipart');
-  const intent = {kind:'submit',model:ctx.model,action:normalized.mode,requestBody:normalized};
-  if (normalized.mode === 'promote') intent.originTaskIds = [normalized.draft_task_id];
-  return intent;
+  return {kind:'submit',model:ctx.model,action:normalized.mode,requestBody:normalized};
 }
 
 function outbound(ctx) {
-  const r = normalizeVideo(ctx.requestBody, ctx.upstreamModel || ctx.model, true);
-  if (r.mode !== 'promote') return r;
-  const sources = ctx.originTasks || [];
-  const source = sources.find(s => s.taskId === r.draft_task_id);
-  const d = source && source.data;
-  if (!source || source.status !== 'SUCCESS' || !d || d.model !== 'seedance_2.5_draft' || d.video_count !== 1 || d.n !== 1 || !source.upstreamTaskId) throw new Error('Promotion requires an owned, completed single-video draft task');
-  if (VIDEO_MODELS['seedance_2.5'].ratios.indexOf(d.ratio) < 0) throw new Error('Invalid draft ratio');
-  return {kind:'video',model:r.model,mode:'promote',source_job_id:source.upstreamTaskId,resolution:r.resolution,ratio:d.ratio,seconds:bounded(d.seconds,undefined,4,30,'draft seconds'),n:1,references:[]};
+  if (ctx.action === 'promote') throw new Error(PROMOTION_UNSUPPORTED);
+  return normalizeVideo(ctx.requestBody, ctx.upstreamModel || ctx.model, true);
 }
 function base(ctx) { return ctx.baseUrl.replace(/\/+$/, ''); }
 function auth(ctx) { return { Authorization:'Bearer ' + ctx.apiKey }; }

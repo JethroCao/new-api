@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {buildCreditPlugin} from './build-credit-plugin.mjs';
 import {VIDEO_MODELS} from './plugin.js';
 globalThis.utils={base64URLDecode:value=>Buffer.from(value,'base64url').toString('utf8')};
-const config={models:Object.keys(VIDEO_MODELS),promotionReservationCreditsPerVideo:2000};
+const config={models:Object.keys(VIDEO_MODELS)};
 const load=async c=>import('data:text/javascript;base64,'+Buffer.from(await buildCreditPlugin(c)).toString('base64'));
 const ctx={publicTaskId:'task_test',model:'seedance_2.5',upstreamModel:'seedance_2.5',operation:'create',apiKey:'bridge-secret',baseUrl:'http://bridge',requestBody:{model:'seedance_2.5',prompt:'waves',seconds:5,n:2,resolution:'480p'}};
 const ack={id:'job-123',object:'video',billing_mode:'credits',status:'queued',model:'seedance_2.5',seconds:5,n:2,mode:'t2v',ratio:'16:9',resolution:'480p',video_count:0,billing:{version:2,request_id:'task_test',reserved_credits:120}};
@@ -135,14 +135,15 @@ test('legacy frozen ceilings remain strict while new estimates can settle upward
  assert.equal(p.parseTaskResult(poll,{...done,billing:{...done.billing,version:1}},{status:200}).status,'UNKNOWN');
 });
 
-test('promotion keeps an explicit unmeasured ceiling and is never priced as text-to-video',async()=>{
+test('credit plugin rejects new promotion even with an owned completed origin task',async()=>{
  const p=await load(config),c={...ctx,requestBody:{mode:'promote',draft_task_id:'task_draft'},originTasks:[{taskId:'task_draft',upstreamTaskId:'draft-job',status:'SUCCESS',data:{model:'seedance_2.5_draft',seconds:5,n:1,video_count:1,ratio:'16:9'}}]};
- assert.deepEqual(p.extractUsage(c),{credits:2000,resolution:'1080p'});
- const promotion=p.buildSubmitRequest(c);
- assert.equal(JSON.parse(promotion.headers['X-Dreamina-Billing']).version,1);
- assert.equal(promotion.body.source_job_id,'draft-job');assert.equal(promotion.body.seconds,5);
- const noPromotion=await load({models:['seedance_2.5']});
- assert.throws(()=>noPromotion.extractUsage(c),/Promotion/);
+ const message={message:'暂不支持样片转正，请直接创建普通视频任务'};
+ assert.throws(()=>p.extractUsage(c),message);
+ assert.throws(()=>p.buildSubmitRequest(c),message);
+ await assert.rejects(buildCreditPlugin({...config,promotionReservationCreditsPerVideo:2000}),message);
+ // Obsolete null settings are harmless but can never enable promotion.
+ const legacyConfig=await load({...config,promotionReservationCreditsPerVideo:null});
+ assert.throws(()=>legacyConfig.extractUsage(c),message);
 });
 
 test('build configuration explicitly selects supported models and rejects obsolete ceiling configuration',async()=>{

@@ -4,7 +4,7 @@ import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from
 import { mkdir, open, readFile, opendir, rename, unlink, lstat } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { isDeepStrictEqual } from 'node:util';
-import { VIDEO_MODELS, normalizeVideo } from './plugin.js';
+import { VIDEO_MODELS, normalizeVideo, PROMOTION_UNSUPPORTED } from './plugin.js';
 import { readReference } from './media-input.mjs';
 import { isAbsolute, join } from 'node:path';
 import { atomicJSON } from './state-file.mjs';
@@ -517,6 +517,12 @@ export class Bridge {
 
   submit(body, key, waitForGateway = false, billing) {
     const op = this.admissions.then(async () => {
+      // Block new promotion admission only. Persisted promotions still resume
+      // through processJob and retain their original quote and resource IDs.
+      if (body && typeof body === 'object' &&
+          (body.mode === 'promote' || Object.hasOwn(body, 'source_job_id') || Object.hasOwn(body, 'draft_task_id'))) {
+        fail(PROMOTION_UNSUPPORTED, 400, 'promotion_not_supported');
+      }
       if (this.closed) fail('bridge closed', 503);
       this.store?.assertHealthy();
       const source = body?.mode==='promote' ? await this.loadJob(body.source_job_id) : undefined;
@@ -681,7 +687,7 @@ export class Bridge {
       n: j.request.n, mode:j.request.mode, ratio:j.request.ratio, resolution:j.request.resolution,
       video_count:j.request.kind === 'video' && j.status === 'completed' ? j.files.length : 0,
       reference_video:(j.request.references || []).some(r=>r.type==='video'),
-      ...(j.request.model === 'seedance_2.5_draft' ? {warning:'样片最长存储 7 天，过期后不可再生成正片；具体期限以即梦服务端为准'} : {}),
+      ...(j.request.model === 'seedance_2.5_draft' ? {warning:'样片最长存储 7 天，具体期限以即梦服务端为准；' + PROMOTION_UNSUPPORTED} : {}),
       seconds: j.request.seconds, image_count: j.status === 'completed' ? j.files.length : j.request.n,
       timings: j.timings ? {...j.timings} : undefined,
       phase: terminal(j) ? j.status : j.attention ? 'needs_attention' : j.downloadResources ? 'downloading' : j.status,

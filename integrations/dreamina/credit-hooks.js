@@ -1,5 +1,5 @@
 // Appended to the shared, self-contained protocol by build-credit-plugin.mjs.
-meta.version='1.3.0';
+meta.version='1.3.1';
 meta.models=CREDIT_MODELS.concat(CREDIT_MODELS.includes('seedance_2.5')?['dreamina-video']:[]);
 meta.usageSchema={
  credits:{type:'number',unit:'credit',description:{en:'Dreamina credit unit price',zh:'即梦积分单价'}},
@@ -28,12 +28,6 @@ const REFERENCE_VIDEO_SECONDS = {
 function reservation(ctx) {
  const r=outbound(ctx);
  if(!CREDIT_MODELS.includes(r.model))throw Error('Credit estimation is not configured for this model');
- // Promotion was not part of the survey and has no separate quote endpoint.
- // Preserve its explicit, operator-selected ceiling instead of inventing a rate.
- if(r.mode==='promote') {
-  if(!PROMOTION_RESERVATION)throw Error('Promotion requires an explicit credit reservation');
-  return {version:1,request_id:ctx.publicTaskId,reserved_credits:PROMOTION_RESERVATION};
- }
  const video=r.references.some(ref=>ref.type==='video');
  const rates=CREDIT_RATES[r.model][r.resolution.toLowerCase()];
  // extractUsage cannot fetch or inspect uploaded media. Reserve the maximum

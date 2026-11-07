@@ -4,7 +4,7 @@ This integration targets official commit `706144769e5bed5a47b78721e3bb11da3cf4c0
 
 ## Components and installation
 
-- `dist/dreamina-cli.js`: uploadable API v1 credit-billing plugin, key `dreamina-cli`, version `1.3.0`. Install through the official task-plugin management API or UI and select it on the bridge channel.
+- `dist/dreamina-cli.js`: uploadable API v1 credit-billing plugin, key `dreamina-cli`, version `1.3.1`. Install through the official task-plugin management API or UI and select it on the bridge channel.
 - `plugin.js`: shared protocol/legacy seconds implementation used by the generator. **Do not upload this source as the credit-billing release.**
 - `bridge.mjs` / `server.mjs`: independent Node.js service running the Canvas CLI; A and B each use their own profile, account/team binding, database context and media directory.
 - `standard-credit-pricing.json`: explicit normal-group price configuration, not host defaults. Its historical 70% benchmark is dated 2026-10-29; it is not a newly checked official price list. Kemeng pricing is outside this configuration.
@@ -13,7 +13,9 @@ The artifact is installed dynamically rather than added to the official built-in
 
 Install locked bridge dependencies with `npm ci` in this directory. Copy `config.example.json` to an operator-owned configuration and fill in the exact CLI profile, user/team, storage paths and channel label. Provide `DREAMINA_BRIDGE_CONFIG`, `DREAMINA_BRIDGE_TOKEN` and `DREAMINA_DATABASE_URL` through the service environment. `node server.mjs --check` validates configuration and the logged-in context without generating media. `node server.mjs` starts the bridge.
 
-The example deliberately authorizes no paid generation (`unlimitedCredits: false`, model limits zero). Production account limits, concurrency, credentials and channel/pricing configuration are operator choices and are not migrated or deployed by these files. Sample promotion needs an explicit `promotionReservationCreditsPerVideo`; there is no invented default quote. The source canvas still has a strict five-video limit and rejects promotion when full.
+The example deliberately authorizes no paid generation (`unlimitedCredits: false`, model limits zero). Production account limits, concurrency, credentials and channel/pricing configuration are operator choices and are not migrated or deployed by these files.
+
+New sample-to-full-video promotion requests are unsupported. Requests with `mode: "promote"`, `draft_task_id` or `source_job_id` are rejected before usage estimation, task creation or CLI submission with `暂不支持样片转正，请直接创建普通视频任务`. Direct bridge POST requests receive HTTP 400 and code `promotion_not_supported`. The obsolete `promotionReservationCreditsPerVideo: null` configuration remains readable, but a non-null value is rejected and cannot enable promotion. Creating draft videos with `seedance_2.5_draft` remains supported.
 
 To rebuild a release, provide a new output filename (the generator refuses overwrites):
 
@@ -37,7 +39,7 @@ Only after the original operation is terminal and delivered media is verified do
 
 The new bridge/plugin exchange private billing receipts through response headers and persist them in plugin private state, not public task data. Completion uses the current hook's returned state, including when the first poll is terminal. Old bridges returning billing in JSON remain compatible, but their raw polling bodies do not gain the new privacy guarantee.
 
-Legacy seconds tasks and origin-task references retain their original frozen pricing and channel ownership. Successful artifacts remain downloadable within the existing retention window. Promotion creates a new task on the source channel/canvas. No migration of live task records is performed by installation.
+Legacy tasks, including previously created promotions, retain their original IDs, frozen pricing and channel ownership. Their existing bridge jobs continue processing and recovering on the original canvas; query, successful settlement, failed-task refund and artifact download remain compatible. Existing promotion records are not recreated through POST: use their original task IDs to query or download. Successful artifacts remain downloadable within the existing retention window. No migration of live task records is performed by installation.
 
 ## Limits of an unchanged host
 

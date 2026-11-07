@@ -14,6 +14,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	runtime "github.com/QuantumNous/new-api/pkg/jsplugin"
+	"github.com/QuantumNous/new-api/relay/channel"
 	adaptor "github.com/QuantumNous/new-api/relay/channel/task/jsplugin"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
@@ -34,6 +35,16 @@ func TestCreditPluginStockHostLifecycle(t *testing.T) {
 	plugin, err := runtime.CompilePlugin(string(source), runtime.Options{})
 	require.NoError(t, err)
 	assert.Equal(t, "dreamina-cli", plugin.Meta.Key)
+	t.Run("protocol decoding rejects new promotions before billing", func(t *testing.T) {
+		for _, body := range []map[string]any{
+			{"kind": "json", "value": map[string]any{"mode": "promote", "draft_task_id": "task_draft"}},
+			{"kind": "multipart", "fields": map[string]any{"mode": []string{"promote"}, "draft_task_id": []string{"task_draft"}}, "files": []any{}},
+		} {
+			intent, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "decodeRequest"}, map[string]any{"operation": "create", "model": "seedance_2.5", "body": body})
+			require.ErrorContains(t, err, "暂不支持样片转正，请直接创建普通视频任务")
+			assert.Nil(t, intent)
+		}
+	})
 	ctx := map[string]any{"publicTaskId": "task_gateway", "model": "seedance_2.5", "upstreamModel": "seedance_2.5", "requestBody": map[string]any{"model": "seedance_2.5", "prompt": "waves", "seconds": 5, "n": 2, "resolution": "480p"}}
 	estimated, err := plugin.Engine.Call(t.Context(), "extractUsage", ctx)
 	require.NoError(t, err)
@@ -55,6 +66,72 @@ func TestCreditPluginStockHostLifecycle(t *testing.T) {
 	require.NotEmpty(t, restored.PrivateData.PluginState)
 	host := adaptor.New(plugin)
 	host.Init(&relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: "https://bridge.example", ApiKey: "test-only"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}})
+	t.Run("historical promotions retain query settlement and download through the stock host", func(t *testing.T) {
+		for _, unit := range []string{"seconds", "credits"} {
+			t.Run(unit, func(t *testing.T) {
+				// These are persisted old tasks; do not recreate them through the now-disabled admission path.
+				stored := *task
+				stored.PrivateData.PluginState = nil
+				previous := map[string]any{"id": "bridge-job", "object": "video", "status": "queued", "model": "seedance_2.5", "seconds": 5, "n": 1, "mode": "promote", "ratio": "16:9", "resolution": "1080p"}
+				receipt := map[string]any{"version": 1, "request_id": "task_gateway", "reserved_credits": 200}
+				if unit == "credits" {
+					frozen := maps.Clone(receipt)
+					for _, key := range []string{"model", "seconds", "n", "mode", "ratio", "resolution"} {
+						frozen[key] = previous[key]
+					}
+					frozen["job_id"] = "bridge-job"
+					stored.PrivateData.PluginState, err = common.Marshal(map[string]any{"billing": frozen})
+					require.NoError(t, err)
+				}
+				stored.Data, err = common.Marshal(previous)
+				require.NoError(t, err)
+				for _, stage := range []struct{ upstream, expected string }{{"in_progress", "IN_PROGRESS"}, {"failed", "FAILURE"}, {"completed", "SUCCESS"}} {
+					body := maps.Clone(previous)
+					body["status"], body["video_count"] = stage.upstream, 0
+					body["billing_mode"] = "legacy_seconds"
+					body["error"] = map[string]any{"message": "20115:本次生成的输出视频未通过版权审核"}
+					if unit == "credits" {
+						body["billing_mode"], body["billing"] = "credits", maps.Clone(receipt)
+					}
+					if stage.upstream == "completed" {
+						body["video_count"], body["terminal_proof"], body["delivery_verified"] = 1, true, true
+						if unit == "credits" {
+							body["billing"].(map[string]any)["credits"] = 80
+							body["billing"].(map[string]any)["basis"] = "accepted_quote"
+						}
+					}
+					payload, err := common.Marshal(body)
+					require.NoError(t, err)
+					result, err := host.ParseTaskResult(&stored, &http.Response{StatusCode: 200, Header: make(http.Header)}, payload)
+					require.NoError(t, err)
+					require.Equal(t, stage.expected, result.Status)
+					if stage.upstream != "completed" {
+						assert.Empty(t, result.UsageFacts)
+						continue
+					}
+					expr, initial, finalQuota := `u("seconds") * 0.8`, 5.0, 2000000
+					if unit == "credits" {
+						expr, initial, finalQuota = `u("credits") * 0.025`, 200, 1000000
+						assert.EqualValues(t, 80, result.UsageFacts["credits"])
+					} else {
+						assert.EqualValues(t, 5, result.UsageFacts["seconds"])
+					}
+					snapshot := &billingexpr.BillingSnapshot{ExprString: expr, ExprHash: billingexpr.ExprHashString(expr), GroupRatio: 1, QuotaPerUnit: 500000, ExprVersion: 1, TaskUsageBilling: true, UsageFacts: map[string]any{unit: initial, "mode": "promote", "resolution": "1080p"}}
+					settled, facts, err := service.EvaluateTaskCompletionUsage(snapshot, result.UsageFacts)
+					require.NoError(t, err)
+					assert.Equal(t, finalQuota, settled.ActualQuotaAfterGroup)
+					assert.Equal(t, "promote", facts["mode"])
+					stored.Status, stored.Data = model.TaskStatusSuccess, payload
+					artifacts, err := host.ListArtifacts(&stored)
+					require.NoError(t, err)
+					require.Len(t, artifacts, 1)
+					download, err := host.BuildContentRequest(t.Context(), &stored, artifacts[0].Key, channel.TaskArtifactClientRequest{Method: http.MethodGet})
+					require.NoError(t, err)
+					assert.Equal(t, "https://bridge.example/v1/jobs/bridge-job/content/0", download.URL)
+				}
+			})
+		}
+	})
 	for _, tc := range []struct {
 		name        string
 		credits     int

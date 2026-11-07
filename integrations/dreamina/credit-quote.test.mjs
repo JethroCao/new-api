@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
 import { Bridge, validateConfig, createServer } from './bridge.mjs';
 import * as plugin from './plugin.js';
 import {buildCreditPlugin} from './build-credit-plugin.mjs';
@@ -50,6 +51,27 @@ async function fixture(t, handler, overrides={}) {
   };
   const bridge=await Bridge.open(config,cli);t.after(()=>bridge.close());await bridge.preflight();
   return {bridge,config,dir,calls,cli};
+}
+
+// Jobs admitted by the previous release must still resume with their frozen
+// terms. New promotion requests are intentionally no longer admitted by submit.
+async function persistHistoricalPromotion(bridge, source, key, billing) {
+  await bridge.save(source);
+  const id = randomUUID();
+  const job = {
+    id, key:createHash('sha256').update(key).digest('hex'), digest:'historical-promotion', context:bridge.contextKey,
+    request:{kind:'video',model:'seedance_2.5',mode:'promote',source_job_id:source.id,
+      resolution:'1080p',ratio:source.request.ratio,seconds:source.request.seconds,n:1,references:[]},
+    nodeId:'node_'+createHash('sha256').update(id).digest('hex').slice(0,10),
+    projectId:bridge.projectId(source),updateId:randomUUID(),submitId:randomUUID(),
+    status:'queued',created_at:Math.floor(Date.now()/1000),timings:{admitted_at_ms:Date.now()},files:[],inputs:[],
+    ...(billing ? {billing,billingMode:'credits'} : {billingMode:'legacy_seconds'}),
+  };
+  await bridge.save(job);
+  await bridge.indexJob(job);
+  bridge.storedJobs++;
+  await bridge.observe(id);
+  return job;
 }
 
 test('each CLI verifies its own member, team and canvas before spending', async t => {
@@ -103,7 +125,7 @@ test('a login change after confirm stops execution without reusing the approved 
   assert.equal(f.calls.some(a => a[1] === 'run'), false);
 });
 
-test('promotion checks its original node on the original canvas before a paid call', async t => {
+test('historical promotion checks its original node on the original canvas before a paid call', async t => {
   for (const kind of ['wrong-member','missing-subject','wrong-source-node']) await t.test(kind, async t => {
     const f = await fixture(t, args => {
       if (args[1] === 'quote') return {
@@ -116,8 +138,7 @@ test('promotion checks its original node on the original canvas before a paid ca
     const draft = await f.bridge.submit({...request,model:'seedance_2.5_draft'},'promotion-source');
     const source = f.bridge.jobs.get(draft.id);
     source.status = 'completed'; source.files = [{resourceId:'original'}];
-    const promoted = await f.bridge.submit({kind:'video',model:'seedance_2.5',mode:'promote',
-      source_job_id:source.id,resolution:'1080p',ratio:'16:9',seconds:5,n:1,references:[]}, 'promotion-identity');
+    const promoted = await persistHistoricalPromotion(f.bridge,source,'promotion-identity');
     await f.bridge.tick();
     const quote = f.calls.find(a => a[1] === 'quote');
     assert.equal(value(quote,'node-id'),source.nodeId);
@@ -129,7 +150,7 @@ test('promotion checks its original node on the original canvas before a paid ca
 });
 
 
-test('promotion rechecks the current member after the durable submission barrier', async t => {
+test('historical promotion rechecks the current member after the durable submission barrier', async t => {
   let switched = false;
   const f=await fixture(t,args=>{
     if (args[0]==='space' && switched) return {kind:'personal',userId:'456'};
@@ -137,7 +158,7 @@ test('promotion rechecks the current member after the durable submission barrier
   },{models:{'seedance_2.5':{kind:'video',model:'seedance_2.5',maxCredits:100},'seedance_2.5_draft':{kind:'video',model:'seedance_2.5_draft',maxCredits:100}}});
   const draft=await f.bridge.submit({...request,model:'seedance_2.5_draft'},'switch-source');
   const source=f.bridge.jobs.get(draft.id);source.status='completed';source.files=[{resourceId:'original'}];
-  const job=await f.bridge.submit({kind:'video',model:'seedance_2.5',mode:'promote',source_job_id:source.id,resolution:'1080p',ratio:source.request.ratio,seconds:5,n:1,references:[]},'switch-promote');
+  const job=await persistHistoricalPromotion(f.bridge,source,'switch-promote');
   const persist=f.bridge.save.bind(f.bridge);
   f.bridge.save=async j=>{
     await persist(j);
@@ -321,13 +342,13 @@ test('unlimited policy still confirms exactly the frozen quote and checks leases
   assert.equal(f.calls.some(a=>a.includes('--yes')),false);
 });
 
-test('promotion stores only an actual returned quote with explicit post-submission timing',async t=>{
+test('historical promotion stores only an actual returned quote with explicit post-submission timing',async t=>{
   for(const quoted of [true,false,'without-node'])await t.test(String(quoted),async t=>{
     const f=await fixture(t,args=>args[1]==='promote'?{submitId:value(args,'submit-id'),...(quoted==='without-node'?{}:{nodeId:'node_promoted'}),state:'accepted',authorizedCredits:300,...(quoted?{totalMaxCredits:75}:{})}:undefined,
       {models:{'seedance_2.5':{kind:'video',model:'seedance_2.5',maxCredits:100},'seedance_2.5_draft':{kind:'video',model:'seedance_2.5_draft',maxCredits:100}}});
     const draft=await f.bridge.submit({...request,model:'seedance_2.5_draft'},'sample');
     const source=f.bridge.jobs.get(draft.id);source.status='completed';source.files=[{resourceId:'original'}];
-    const j=await f.bridge.submit({kind:'video',model:'seedance_2.5',mode:'promote',source_job_id:draft.id,resolution:'1080p',ratio:'16:9',seconds:5,n:1,references:[]},'promote');
+    const j=await persistHistoricalPromotion(f.bridge,source,'promote');
     await f.bridge.tick();const quote=f.bridge.jobs.get(j.id).upstreamCreditQuote;
     assert.equal(f.bridge.get(j.id).status,'in_progress');
     if(quoted){assert.equal(quote.credits,75);assert.equal(quote.quote_stage,'submission_response');assert.equal(quote.node_id,quoted==='without-node'?undefined:'node_promoted');}
@@ -385,12 +406,12 @@ test('invalid gateway billing contracts are rejected without admitting a job',as
  assert.equal(f.bridge.jobs.size,0);assert.equal(f.calls.some(a=>a[0]==='node'),false);
 });
 
-test('promotion enforces gateway ceiling even with unlimited operator credits',async t=>{
+test('historical promotion enforces gateway ceiling even with unlimited operator credits',async t=>{
  const f=await fixture(t,args=>args[1]==='promote'?{submitId:value(args,'submit-id'),state:'accepted',totalMaxCredits:75}:undefined,
   {unlimitedCredits:true,models:{'seedance_2.5':{kind:'video',model:'seedance_2.5',maxCredits:0},'seedance_2.5_draft':{kind:'video',model:'seedance_2.5_draft',maxCredits:0}}});
  const draft=await f.bridge.submit({...request,model:'seedance_2.5_draft'},'sample-credit');
  const source=f.bridge.jobs.get(draft.id);source.status='completed';source.files=[{resourceId:'original'}];
- const j=await f.bridge.submit({kind:'video',model:'seedance_2.5',mode:'promote',source_job_id:draft.id,resolution:'1080p',ratio:'16:9',seconds:5,n:1,references:[]},'promote-credit',false,{version:1,request_id:'promote-credit',reserved_credits:100});
+ const j=await persistHistoricalPromotion(f.bridge,source,'promote-credit',{version:1,request_id:'promote-credit',reserved_credits:100});
  await f.bridge.tick();const args=f.calls.find(a=>a[1]==='promote');
  assert.ok(args.includes('--credit-ceiling=100'));assert.equal(args.includes('--yes'),false);
  assert.equal(f.bridge.get(j.id).billing.credits,75);
@@ -406,14 +427,14 @@ test('HTTP submission carries the internal billing reservation and rejects malfo
  }
 });
 
-test('promotion never settles a quote from an unacknowledged or different submission',async t=>{
+test('historical promotion never settles a quote from an unacknowledged or different submission',async t=>{
  for(const kind of ['wrong-id','unknown-state','rejected','wrong-node','wrong-resource'])await t.test(kind,async t=>{
   const f=await fixture(t,args=>args[1]==='promote'?{submitId:kind==='wrong-id'?'different-operation':value(args,'submit-id'),state:kind==='unknown-state'?'unknown':kind==='rejected'?'rejected':'accepted',totalMaxCredits:99,
     ...(kind==='wrong-node'?{sourceNodeId:'node_other'}:{}), ...(kind==='wrong-resource'?{sourceResourceId:'other'}:{})}:undefined,
    {unlimitedCredits:true,models:{'seedance_2.5':{kind:'video',model:'seedance_2.5',maxCredits:0},'seedance_2.5_draft':{kind:'video',model:'seedance_2.5_draft',maxCredits:0}}});
   const draft=await f.bridge.submit({...request,model:'seedance_2.5_draft'},'binding-source');
   const source=f.bridge.jobs.get(draft.id);source.status='completed';source.files=[{resourceId:'original'}];
-  const j=await f.bridge.submit({kind:'video',model:'seedance_2.5',mode:'promote',source_job_id:draft.id,resolution:'1080p',ratio:'16:9',seconds:5,n:1,references:[]},'binding-promotion',false,{version:1,request_id:'binding-promotion',reserved_credits:100});
+  const j=await persistHistoricalPromotion(f.bridge,source,'binding-promotion',{version:1,request_id:'binding-promotion',reserved_credits:100});
   await f.bridge.tick();const job=f.bridge.jobs.get(j.id);
   assert.equal(job.upstreamCreditQuote,undefined,'an unrelated or unacknowledged quote is not billing evidence');
   const stored=JSON.parse(await readFile(join(f.dir,j.id+'.json'),'utf8'));
