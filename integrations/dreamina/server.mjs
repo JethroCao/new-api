@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { Bridge, validateConfig, createServer } from './bridge.mjs';
+import { GatewayTaskReader } from './gateway-task-reader.mjs';
 
 let bridge, server, timer, cleanupTimer, stopping = false;
 async function stop(exitCode = 0) {
@@ -17,14 +18,22 @@ try {
   if (!process.env.DREAMINA_BRIDGE_CONFIG) throw new Error('Set DREAMINA_BRIDGE_CONFIG to your configuration JSON path');
   const input = JSON.parse(await readFile(resolve(process.env.DREAMINA_BRIDGE_CONFIG), 'utf8'));
   const config = validateConfig({ ...input, token: process.env.DREAMINA_BRIDGE_TOKEN, databaseUrl:process.env.DREAMINA_DATABASE_URL });
+  const gatewayDatabaseUrl = process.env.DREAMINA_GATEWAY_DATABASE_URL;
+  if (!!gatewayDatabaseUrl !== (config.gatewayChannelId !== undefined)) throw new Error('Set both DREAMINA_GATEWAY_DATABASE_URL and gatewayChannelId to enable gateway confirmation');
   // Preflight never creates a canvas, changes space, authorizes a debit, or
   // starts a login flow. The operator prepares a dedicated CLI profile.
   const probe = new Bridge(config);
   await probe.preflight();
   if (process.argv.includes('--check')) {
+    if (gatewayDatabaseUrl) {
+      const reader = await GatewayTaskReader.open({url:gatewayDatabaseUrl,channelId:config.gatewayChannelId});
+      try { await reader.inspect([{id:'00000000-0000-0000-0000-000000000000',taskId:'task_gateway_configuration_probe'}]); }
+      finally { await reader.close(); }
+    }
     console.log('Dreamina context and model configuration verified (no generation performed).');
   } else {
     bridge = await Bridge.open(config);
+    if (gatewayDatabaseUrl) bridge.gatewayTaskReader = await GatewayTaskReader.open({url:gatewayDatabaseUrl,channelId:config.gatewayChannelId});
     bridge.promptLimits = probe.promptLimits;
     bridge.videoCatalog = probe.videoCatalog;
     bridge.catalogCheckedAt = probe.catalogCheckedAt;

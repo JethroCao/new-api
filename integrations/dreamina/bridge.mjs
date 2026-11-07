@@ -98,11 +98,12 @@ function equal(a, b) {
 export function validateConfig(input) {
   const c = { host: '127.0.0.1', port: 8787, profile: 'default', region: 'cn',
     storage: 'file', migrateLegacy: false, pollMs: 1000, pollIntervalMs: 3000, catalogTTLms: 60000, commandTimeoutMs: 120000, maxQueue: 20, historyCacheSize: 100,
-    maxConcurrent: 2, maxAdmissions: 2, maxInputBytes: 64 * 1024 * 1024, maxMediaBytes: 512 * 1024 * 1024, mediaTTL: 3600, maxQueueWaitSeconds: 1800, leaseSeconds: 300, submitWorkers: 6, pollWorkers: 4, downloadWorkers: 2, uploadWorkers: 4, unlimitedCredits: false, canvasTaskLimit: 0, canvasChannel: '', ...input };
+    maxConcurrent: 2, maxAdmissions: 2, maxInputBytes: 64 * 1024 * 1024, maxMediaBytes: 512 * 1024 * 1024, mediaTTL: 3600, maxQueueWaitSeconds: 1800, leaseSeconds: 300, submitWorkers: 6, pollWorkers: 4, downloadWorkers: 2, uploadWorkers: 4, inputPreparationWorkers: 4, unlimitedCredits: false, canvasTaskLimit: 0, canvasChannel: '', ...input };
   if (!['file','database'].includes(c.storage) || typeof c.migrateLegacy!=='boolean') fail('invalid storage configuration');
   if (c.storage==='database' && !c.databaseUrl) fail('database storage requires DREAMINA_DATABASE_URL');
   if (![0,5].includes(c.canvasTaskLimit)) fail('invalid config canvasTaskLimit (0 or 5)');
   if (!['','A','B'].includes(c.canvasChannel)) fail('invalid config canvasChannel (A or B)');
+  if (c.gatewayChannelId !== undefined && !integer(c.gatewayChannelId,1,2147483647)) fail('invalid config gatewayChannelId');
   if (typeof c.unlimitedCredits !== 'boolean') fail('invalid config unlimitedCredits');
   if (c.creditCostCnyPerCredit !== undefined && (typeof c.creditCostCnyPerCredit !== 'string' ||
       !/^(?:0|[1-9]\d{0,5})(?:\.\d{1,12})?$/.test(c.creditCostCnyPerCredit) || Number(c.creditCostCnyPerCredit) <= 0)) fail('invalid config creditCostCnyPerCredit');
@@ -117,7 +118,7 @@ export function validateConfig(input) {
   c.publicUrl = url.origin;
   for (const [key, min, max] of [['port', 1, 65535], ['pollMs', 1000, 60000], ['commandTimeoutMs', 1000, 600000],
     ['maxQueue', 1, 200], ['maxConcurrent', 1, 200], ['maxAdmissions', 1, 200], ['maxInputBytes', 1, 64 * 1024 * 1024], ['historyCacheSize', 1, 1000], ['maxMediaBytes', 1, 1073741824], ['mediaTTL', 60, 86400],
-    ['maxQueueWaitSeconds', 1, 1800], ['leaseSeconds', 1, 300], ['submitWorkers', 1, 12], ['pollWorkers', 1, 8], ['downloadWorkers', 1, 4], ['uploadWorkers', 1, 4], ['pollIntervalMs', 1000, 60000], ['catalogTTLms', 1000, 60000]]) {
+    ['maxQueueWaitSeconds', 1, 1800], ['leaseSeconds', 1, 300], ['submitWorkers', 1, 12], ['pollWorkers', 1, 8], ['downloadWorkers', 1, 4], ['uploadWorkers', 1, 4], ['inputPreparationWorkers', 1, 4], ['pollIntervalMs', 1000, 60000], ['catalogTTLms', 1000, 60000]]) {
     if (!integer(c[key], min, max)) fail('invalid config ' + key);
   }
   if (!c.models || Array.isArray(c.models) || !Object.keys(c.models).length) fail('config models are required');
@@ -326,6 +327,8 @@ export class Bridge {
     this.cli = args => {this.store?.assertHealthy();return invokeCLI(args);};
     this.contextKey = hash(JSON.stringify([config.profile, config.region, config.userId, config.space, config.projectId, config.models]));
     this.jobs = new Map(); this.history = new Map(); this.storedJobs = 0; this.admissions = Promise.resolve();
+    this.pendingAdmissions = new Map(); this.preparingUnits = 0;
+    this.activePreparations = 0; this.preparationWaiters = []; this.readInput = readReference;
     this.lastQueuedId = null; this.lastPolledId = null; this.lastDownloadedId = null;
     this.nextPoll = new Map(); this.nextDownload = new Map();
     this.catalogCheckedAt = null; this.catalogRefresh = null; this.contextCheck = null;
@@ -337,12 +340,18 @@ export class Bridge {
     this.uploadWaiters = [];
     this.videoCatalog = new Map();
     this.leases = new Map(); // Deliberately not restored after downtime.
+    this.gatewayLeases = new Map(); this.gatewayBlocks = new Set(); this.dispatchChecks = new Set();
+    this.gatewayTaskReader = null; this.gatewayConfirmation = null;
+    this.nextGatewayConfirmation = 0; this.gatewayConfirmationFailures = 0;
   }
 
   async close() {
     if (this.closed) return;
     this.closed = true;
     await this.admissions;
+    await Promise.allSettled([...this.pendingAdmissions.values()].map(pending => pending.promise));
+    if(this.gatewayConfirmation)await this.gatewayConfirmation;
+    if(this.gatewayTaskReader?.close)await this.gatewayTaskReader.close();
     if(this.mediaCleanup)await this.mediaCleanup.catch(()=>{});
     await Promise.allSettled([...this.inFlight.values()].map(work => work.promise));
     await Promise.allSettled([...this.receiptChecks.values()]);
@@ -399,22 +408,28 @@ export class Bridge {
     await this.save(job);
   }
 
-  async verifyDispatchIdentity(job) {
-    // The durable in-progress barrier has already been written. Read the
-    // current profile immediately before dispatch, without another write in
-    // between. A dedicated profile must not be reauthenticated by other tools.
-    try { await this.verifyCurrentSpace(); }
-    catch (error) {
-      job.status = 'queued'; // this invocation has certainly not dispatched
-      await this.holdForContext(job, error);
-      return false;
-    }
-    if (this.closed || !(this.leases.get(job.id) > Date.now()) ||
-        Date.now() >= (job.created_at + this.config.maxQueueWaitSeconds) * 1000) {
-      job.status = 'queued'; job.attention = 'awaiting_gateway'; await this.save(job);
-      return false;
-    }
-    return true;
+  async prepareDispatch(job) {
+    // No paid call has begun. Keep the durable barrier write and final
+    // identity read eligible for batch confirmation
+    // so a slow CLI context lookup cannot repeatedly exhaust its short lease.
+    this.dispatchChecks.add(job.id);
+    try {
+      job.status = 'in_progress';
+      this.recordTime(job, 'submit_started_at_ms');
+      await this.save(job);
+      try { await this.verifyCurrentSpace(); }
+      catch (error) {
+        job.status = 'queued'; // this invocation has certainly not dispatched
+        await this.holdForContext(job, error);
+        return false;
+      }
+      if (this.closed || !this.dispatchAllowed(job) ||
+          Date.now() >= (job.created_at + this.config.maxQueueWaitSeconds) * 1000) {
+        job.status = 'queued'; job.attention = 'awaiting_gateway'; await this.save(job);
+        return false;
+      }
+      return true;
+    } finally { this.dispatchChecks.delete(job.id); }
   }
 
   async refreshVideoCatalog() {
@@ -518,9 +533,9 @@ export class Bridge {
   }
 
   submit(body, key, waitForGateway = false, billing) {
-    const op = this.admissions.then(async () => {
-      // Block new promotion admission only. Persisted promotions still resume
-      // through processJob and retain their original quote and resource IDs.
+    // Only admission bookkeeping is serialized. Never hold this lock while
+    // waiting for input media: one slow origin must not stall unrelated POSTs.
+    const admission = this.admissions.then(async () => {
       if (body && typeof body === 'object' &&
           (body.mode === 'promote' || Object.hasOwn(body, 'source_job_id') || Object.hasOwn(body, 'draft_task_id'))) {
         fail(PROMOTION_UNSUPPORTED, 400, 'promotion_not_supported');
@@ -536,63 +551,104 @@ export class Bridge {
         billing={version:billing.version,request_id:key,reserved_credits:billing.reserved_credits};
       }
       const keyHash = hash(key), digest = hash(JSON.stringify(billing ? {request,billing} : request));
+      const pending = this.pendingAdmissions.get(keyHash);
+      if (pending) {
+        if (pending.digest !== digest) fail('idempotency conflict', 409);
+        return {result: pending.promise};
+      }
       const existingId = await this.findJobKey(keyHash);
       const existing = existingId ? await this.loadJob(existingId,true) : undefined;
       if (existing) {
         if (existing.digest !== digest) fail('idempotency conflict', 409);
-        return this.observe(existing.id,existing);
+        // Retrying POST proves receipt by the bridge, not host persistence.
+        return {result: waitForGateway ? this.verifyDelivery(existing) : this.observe(existing.id,existing)};
       }
       if (request.n > this.config.maxConcurrent) fail('requested count exceeds generation capacity', 429);
-      if ([...this.jobs.values()].filter(j => !terminal(j)).reduce((n,j) => n + j.request.n, 0) + request.n > this.config.maxQueue) fail('Active video queue is full. Please retry after existing tasks finish.', 429, 'active_queue_full');
+      const activeUnits = [...this.jobs.values()].filter(j => !terminal(j)).reduce((n,j) => n + j.request.n, 0);
+      if (activeUnits + this.preparingUnits + request.n > this.config.maxQueue) fail('Active video queue is full. Please retry after existing tasks finish.', 429, 'active_queue_full');
       const job = { id: randomUUID(), key: keyHash, digest, context: this.contextKey, request, ...(billing?{billing}:{}),
+        ...(waitForGateway && /^task_[A-Za-z0-9_-]{1,160}$/.test(key) ? {gatewayTaskId:key} : {}),
         ...(request.kind === 'video' ? {billingMode: billing ? 'credits' : 'legacy_seconds'} : {}),
         nodeId: 'node_' + Array.from(randomBytes(10), b => '0123456789abcdefghjkmnpqrstvwxyz'[b & 31]).join(''), updateId: randomUUID(), submitId: randomUUID(),
         status: 'queued', created_at: Math.floor(Date.now() / 1000), timings: {admitted_at_ms: Date.now()}, files: [], inputs: [] };
-      // Only local file identities/hashes are persisted. In particular, signed
-      // input URLs and base64 payloads never enter job snapshots or responses.
-      let saving=false;
-      try {
+      const reservation = {digest, units: request.n};
+      this.preparingUnits += reservation.units;
+      this.pendingAdmissions.set(keyHash,reservation);
+      reservation.promise = this.prepareAdmission(job,source,waitForGateway,reservation).finally(() => {
+        this.preparingUnits -= reservation.units;
+        this.pendingAdmissions.delete(keyHash);
+      });
+      // Wrapping the promise prevents the admission lock from awaiting I/O.
+      return {result: reservation.promise};
+    });
+    this.admissions = admission.then(() => {}, () => {});
+    return admission.then(({result}) => result);
+  }
+
+  async prepareAdmission(job, source, waitForGateway, reservation) {
+    const request = job.request;
+    let saving=false, preparing=false;
+    try {
+      if (request.references?.length) {
+        if (this.activePreparations < this.config.inputPreparationWorkers) this.activePreparations++;
+        else await new Promise(resolve => this.preparationWaiters.push(resolve));
+        preparing=true;
+        if (this.closed) fail('bridge closed',503);
+        this.recordTime(job,'input_preparation_started_at_ms');
         let remaining = this.config.maxInputBytes;
         const inputDeadline = AbortSignal.timeout(30000);
-        for (const ref of request.references || []) {
+        for (const ref of request.references) {
+          if (this.closed) fail('bridge closed',503);
           let media;
-          try { media = await readReference(ref, remaining, inputDeadline); } catch { fail('invalid or unavailable reference media'); }
+          try { media = await this.readInput(ref,remaining,inputDeadline); } catch { fail('invalid or unavailable reference media'); }
+          if (this.closed) fail('bridge closed',503);
           remaining -= media.bytes.length;
           const resourceId = randomUUID(), filename = job.id + '-input-' + job.inputs.length + '.' + media.extension;
-          const file = await open(join(this.config.dataDir, filename), 'wx', 0o600);
-          try { await file.writeFile(media.bytes); await file.sync(); } finally { await file.close(); }
+          // Track before writing so a failed write also removes the partial file.
           job.inputs.push({resourceId,filename,type:ref.type,sha256:hash(media.bytes),uploaded:false});
+          const file = await open(join(this.config.dataDir,filename),'wx',0o600);
+          try { await file.writeFile(media.bytes); await file.sync(); } finally { await file.close(); }
         }
-        if (request.references) request.references = job.inputs.map(input => ({type:input.type}));
+        this.recordTime(job,'input_preparation_completed_at_ms');
+      }
+      // Signed URLs and base64 never enter durable snapshots.
+      if (request.references) request.references = job.inputs.map(input => ({type:input.type}));
+      const commit = this.admissions.then(async () => {
+        if (this.closed) fail('bridge closed',503);
+        this.store?.assertHealthy();
         const reserved = this.canvases.lookup(job);
         if (reserved) {
           job.projectId = reserved.projectId;
           job.canvasName = reserved.name;
         } else if (this.config.canvasTaskLimit === 5) {
-          const canvas = await this.canvases.reserve(job, source ? this.projectId(source) : undefined);
+          const canvas = await this.canvases.reserve(job,source ? this.projectId(source) : undefined);
           job.projectId = canvas.projectId;
           job.canvasName = canvas.name;
         } else {
-          // Fixed mode only affects new independent jobs. Source-bound work
-          // must keep its project even when rotation has been switched off.
           job.projectId = source ? this.projectId(source) : this.config.projectId;
-          if (job.projectId !== this.config.projectId) await this.canvases.reserve(job, job.projectId);
+          if (job.projectId !== this.config.projectId) await this.canvases.reserve(job,job.projectId);
         }
         saving=true;
         await this.save(job);
-      } catch(e) {
-        // A lost commit response may still mean the job was persisted. Keep
-        // its inputs until recovery establishes the authoritative DB state.
-        if(!saving)for (const input of job.inputs) await unlink(join(this.config.dataDir,input.filename)).catch(()=>{});
-        throw e;
+        // The durable job now holds this capacity; do not double count it.
+        this.preparingUnits -= reservation.units; reservation.units=0;
+        this.storedJobs++;
+        await this.indexJob(job);
+        if (!waitForGateway) this.leases.set(job.id,Date.now()+this.config.leaseSeconds*1000);
+        return this.get(job.id);
+      });
+      this.admissions = commit.then(() => {}, () => {});
+      return await commit;
+    } catch(error) {
+      // A lost commit response may mean the snapshot is already durable.
+      if(!saving)for(const input of job.inputs)await unlink(join(this.config.dataDir,input.filename)).catch(()=>{});
+      throw error;
+    } finally {
+      if(preparing) {
+        const next=this.preparationWaiters.shift();
+        if(next)next();else this.activePreparations--;
       }
-      this.storedJobs++;
-      await this.indexJob(job);
-      if (!waitForGateway) this.leases.set(job.id, Date.now() + this.config.leaseSeconds * 1000);
-      return this.get(job.id);
-    });
-    this.admissions = op.catch(() => {});
-    return op;
+    }
   }
 
   async save(job) {
@@ -606,7 +662,7 @@ export class Bridge {
     this.history.delete(job.id);
     if(!terminal(job))return;
     this.history.set(job.id,true);
-    this.nextPoll.delete(job.id);this.nextDownload.delete(job.id);this.leases.delete(job.id);
+    this.nextPoll.delete(job.id);this.nextDownload.delete(job.id);this.leases.delete(job.id);this.gatewayLeases.delete(job.id);this.gatewayBlocks.delete(job.id);
     while(this.history.size>this.config.historyCacheSize) {
       const id=this.history.keys().next().value;
       this.history.delete(id);this.jobs.delete(id);
@@ -821,7 +877,75 @@ export class Bridge {
 
   sign(path, expires) { return createHmac('sha256', this.config.token).update('media\n' + path + '\n' + expires).digest('hex'); }
 
+  dispatchAllowed(job) {
+    return !this.closed && !terminal(job) && !this.gatewayBlocks.has(job.id) &&
+      Math.max(this.leases.get(job.id) || 0, this.gatewayLeases.get(job.id) || 0) > Date.now();
+  }
+
+  confirmGatewayTasks() {
+    if (this.gatewayConfirmation) return this.gatewayConfirmation;
+    if (this.closed || !this.gatewayTaskReader || Date.now() < this.nextGatewayConfirmation) return Promise.resolve();
+    const started = Date.now();
+    this.nextGatewayConfirmation = started + 1000;
+    const candidates = [];
+    for (const job of this.jobs.values()) {
+      if ((job.status !== 'queued' && !this.dispatchChecks.has(job.id)) ||
+          started >= (job.created_at + this.config.maxQueueWaitSeconds) * 1000) continue;
+      const taskId = job.gatewayTaskId || job.billing?.request_id;
+      if (typeof taskId !== 'string' || !/^task_[A-Za-z0-9_-]{1,160}$/.test(taskId) || hash(taskId) !== job.key) continue;
+      candidates.push({id: job.id, taskId});
+    }
+    if (!candidates.length) return Promise.resolve();
+    // maxQueue bounds this set at 200. This is one indexed host read, never a
+    // scan of historical jobs or one query/timer per pending task.
+    const confirmation = (async () => {
+      let matches;
+      try { matches = await this.gatewayTaskReader.inspect(candidates); }
+      catch {
+        this.gatewayConfirmationFailures = Math.min(this.gatewayConfirmationFailures + 1, 6);
+        this.nextGatewayConfirmation = Date.now() + Math.min(30000, 1000 * 2 ** (this.gatewayConfirmationFailures - 1));
+        this.onEvent?.({event: 'dreamina_gateway_confirmation_unavailable', retry_at_ms: this.nextGatewayConfirmation});
+        return; // existing authenticated host polls can still grant their lease
+      }
+      if (this.closed) return;
+      this.gatewayConfirmationFailures = 0;
+      for (const {id, taskId} of candidates) {
+        const job = this.jobs.get(id);
+        if (!job || (job.status !== 'queued' && !this.dispatchChecks.has(id)) || terminal(job) || hash(taskId) !== job.key) continue;
+        const state = matches.get(id);
+        if (state !== 'active') {
+          this.gatewayLeases.delete(id);
+          if (state === 'terminal' || state === 'mismatch') {
+            this.gatewayBlocks.add(id);
+            this.leases.delete(id); // do not let an older GET override a known host rejection
+          }
+          continue;
+        }
+        // Freshness is measured from query start, not response arrival. Long
+        // preparation workflows are reconfirmed in subsequent batches.
+        if (Date.now() >= started + 5000) continue;
+        this.gatewayBlocks.delete(id);
+        if (job.timings?.gateway_confirmed_at_ms === undefined) {
+          this.recordTime(job, 'gateway_confirmed_at_ms');
+          await this.save(job);
+        }
+        if (!this.closed && !terminal(job) && (job.status === 'queued' || this.dispatchChecks.has(id))) this.gatewayLeases.set(id, started + 5000);
+      }
+    })();
+    this.gatewayConfirmation = confirmation.finally(() => { this.gatewayConfirmation = null; });
+    return this.gatewayConfirmation;
+  }
+
   tick() {
+    const confirmation = this.confirmGatewayTasks();
+    // Existing polls/downloads must keep moving while the optional host read
+    // is pending. A confirmed batch wakes free submission workers immediately.
+    const scheduled = this.dispatchReadyJobs();
+    if (!this.gatewayConfirmation) return scheduled;
+    return Promise.all([scheduled, confirmation.then(() => this.dispatchReadyJobs())]).then(() => {});
+  }
+
+  dispatchReadyJobs() {
     if(this.store?.poisoned)return Promise.reject(storageError());
     if (this.closed) return Promise.resolve();
     if (this.schedulerError) return Promise.reject(this.schedulerError);
@@ -847,7 +971,7 @@ export class Bridge {
         if (!expired && Date.now() < (job.diagnostics?.next_context_check_at_ms || 0)) continue;
         const projectId = this.projectId(job);
         if (lane === 'submit' && !expired) {
-          if (!(this.leases.get(job.id) > Date.now()) || occupied + job.request.n > this.config.maxConcurrent || busyCanvases.has(projectId)) continue;
+          if (!this.dispatchAllowed(job) || occupied + job.request.n > this.config.maxConcurrent || busyCanvases.has(projectId)) continue;
           occupied += job.request.n;
           busyCanvases.add(projectId);
         }
@@ -1015,7 +1139,7 @@ export class Bridge {
     if(!this.config.unlimitedCredits && item.maxCredits>configured.maxCredits) {
       this.failed(job,'credit_approval_required');await this.save(job);return;
     }
-    if(this.closed || !(this.leases.get(job.id)>Date.now()) || Date.now()>=(job.created_at+this.config.maxQueueWaitSeconds)*1000) {
+    if(this.closed || !this.dispatchAllowed(job) || Date.now()>=(job.created_at+this.config.maxQueueWaitSeconds)*1000) {
       job.attention='awaiting_gateway';await this.save(job);return;
     }
     let approval;
@@ -1030,11 +1154,10 @@ export class Bridge {
       this.failed(job, confirmedSubjectError); await this.save(job); return;
     }
     this.recordTime(job, 'credit_confirmed_at_ms');
-    if(this.closed || !(this.leases.get(job.id)>Date.now()) || Date.now()>=(job.created_at+this.config.maxQueueWaitSeconds)*1000) {
+    if(this.closed || !this.dispatchAllowed(job) || Date.now()>=(job.created_at+this.config.maxQueueWaitSeconds)*1000) {
       job.attention='awaiting_gateway';await this.save(job);return;
     }
-    job.status='in_progress';this.recordTime(job,'submit_started_at_ms');await this.save(job);
-    if (!(await this.verifyDispatchIdentity(job))) return;
+    if (!(await this.prepareDispatch(job))) return;
     try {
       // The opaque token remains local to this invocation; it never enters
       // job data, errors, response headers, or emitted diagnostics.
@@ -1107,14 +1230,14 @@ export class Bridge {
       if (Date.now() >= (job.created_at + this.config.maxQueueWaitSeconds) * 1000) {
         this.failed(job, 'queue_expired'); await this.save(job); return;
       }
-      if (!(this.leases.get(job.id) > Date.now())) { job.attention = 'awaiting_gateway'; await this.save(job); return; }
+      if (!this.dispatchAllowed(job)) { job.attention = 'awaiting_gateway'; await this.save(job); return; }
       try {
         await this.canvases.ensureCreated(this.projectId(job), canvas =>
           this.cli(['canvas','create',canvas.name,'--project-id='+canvas.projectId]));
       } catch { job.attention='canvas_creation_pending';await this.save(job);return; }
       this.recordTime(job, 'canvas_ready_at_ms');
       if (this.closed) return;
-      if (Date.now() >= (job.created_at+this.config.maxQueueWaitSeconds)*1000 || !(this.leases.get(job.id)>Date.now())) {
+      if (Date.now() >= (job.created_at+this.config.maxQueueWaitSeconds)*1000 || !this.dispatchAllowed(job)) {
         job.attention='awaiting_gateway';await this.save(job);return;
       }
       if (Object.hasOwn(VIDEO_MODELS, job.request.model)) {
@@ -1135,7 +1258,7 @@ export class Bridge {
         this.recordTime(job, 'references_ready_at_ms');
         // Preparation can take longer than the lease. Never generate for a
         // gateway that abandoned a request while it was downloading/uploading.
-        if (Date.now() >= (job.created_at+this.config.maxQueueWaitSeconds)*1000 || !(this.leases.get(job.id)>Date.now())) {
+        if (Date.now() >= (job.created_at+this.config.maxQueueWaitSeconds)*1000 || !this.dispatchAllowed(job)) {
           job.attention='awaiting_gateway';await this.save(job);return;
         }
       }
@@ -1170,14 +1293,11 @@ export class Bridge {
         this.failed(job, identityError); await this.save(job); return;
       }
       if (this.closed || Date.now() >= (job.created_at + this.config.maxQueueWaitSeconds) * 1000 ||
-          !(this.leases.get(job.id) > Date.now())) {
+          !this.dispatchAllowed(job)) {
         job.attention = 'awaiting_gateway'; await this.save(job); return;
       }
       // Durable transition BEFORE any remote mutation. A crash from here on
       // only permits read-only recovery of this exact submit identity.
-      job.status = 'in_progress';
-      this.recordTime(job, 'submit_started_at_ms');
-      await this.save(job);
       const r = job.request, m = this.config.models[r.model];
       // Only the operator can approve uncapped spending. Client payloads cannot
       // override this policy; the gateway still reserves user quota first.
@@ -1190,7 +1310,7 @@ export class Bridge {
         '--update-id=' + job.updateId, '--submit-id=' + job.submitId, '--mode=t2i', '--model=' + m.model,
         '--prompt=' + r.prompt, '--ratio=' + m.ratio, '--resolution=' + m.resolution,
         '--count=' + r.n, creditApproval, '--run'];
-      if (!(await this.verifyDispatchIdentity(job))) return;
+      if (!(await this.prepareDispatch(job))) return;
       try {
         const result = await this.cli(args);
         if (r.mode === 'promote') {
@@ -1571,6 +1691,9 @@ export function createServer(bridge) {
       if (media && ['GET', 'HEAD'].includes(req.method)) return await content(bridge, req, res, media[1], Number(media[2]));
       if (req.method === 'GET' && url.pathname === '/healthz') return json(res, 200, { status: bridge.schedulerError || bridge.store?.poisoned ? 'error' : 'ok', storage:bridge.config.storage, stored_jobs:bridge.storedJobs, cached_history:bridge.history.size, queued: [...bridge.jobs.values()].filter(j => !terminal(j)).length,
         waiting: [...bridge.jobs.values()].filter(j => j.status === 'queued').length,
+        preparing_requests: bridge.pendingAdmissions.size, preparing_units: bridge.preparingUnits,
+        active_input_preparations: bridge.activePreparations,
+        gateway_confirmation_enabled: !!bridge.gatewayTaskReader, gateway_confirmation_failures: bridge.gatewayConfirmationFailures,
         running: [...bridge.jobs.values()].filter(j => j.status === 'in_progress').length,
         submit_workers: [...bridge.inFlight.values()].filter(w => w.lane === 'submit').length,
         poll_workers: [...bridge.inFlight.values()].filter(w => w.lane === 'poll').length,

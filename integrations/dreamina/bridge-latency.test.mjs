@@ -5,6 +5,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {createHash,randomUUID} from 'node:crypto';
 import {Bridge,validateConfig,createServer} from './bridge.mjs';
+import {readReference} from './media-input.mjs';
 import {quotedCLI} from './fixtures/quote-cli.mjs';
 import * as plugin from './plugin.js';
 import {buildCreditPlugin} from './build-credit-plugin.mjs';
@@ -813,4 +814,84 @@ test('a receipt cannot certify delivery when retention expires during file verif
   bridge.verifiedMedia.get=record=>{t.mock.timers.setTime(expires*1000);return cached(record);};
   const receipt=await bridge.observe(job.id);
   assert.equal(receipt.content_expired,true);assert.equal(receipt.delivery_verified,false);
+});
+
+
+test('held input preparation does not block unrelated submissions and coalesces duplicate keys',async t=>{
+  const {bridge,cfg}=await fixture(t,{inputPreparationWorkers:1});
+  const entered=Promise.withResolvers(),release=Promise.withResolvers();let reads=0;
+  bridge.readInput=async(...args)=>{reads++;entered.resolve();await release.promise;return readReference(...args);};
+  const body={...request,mode:'m2v',references:[{type:'image',url:png}]};
+  const slow=bridge.submit(body,'parallel-input',true);
+  let duplicate;
+  try {
+    await Promise.race([entered.promise,slow.then(()=>assert.fail('reference preparation was not dispatched through its bounded input worker'))]);
+    duplicate=bridge.submit(body,'parallel-input',true);
+    await assert.rejects(bridge.submit({...body,prompt:'different'},'parallel-input',true),e=>e.status===409);
+    const fast=await bridge.submit(request,'independent-input',true);
+    assert.equal(fast.status,'queued');
+    assert.equal(reads,1,'duplicate POST must share preparation');
+    assert.equal(bridge.leases.has(fast.id),false);
+    release.resolve();
+    const [a,b]=await Promise.all([slow,duplicate]);
+    assert.equal(a.id,b.id);
+    assert.equal(bridge.jobs.size,2);
+    assert.equal(bridge.leases.has(a.id),false);
+    await bridge.submit(body,'parallel-input',true);
+    assert.equal(bridge.leases.has(a.id),false,'duplicate POST is not a host persistence acknowledgement');
+    const saved=await readFile(join(cfg.dataDir,a.id+'.json'),'utf8');
+    assert.equal(saved.includes('base64'),false);
+    assert.equal(bridge.jobs.get(a.id).inputs.length,1);
+  } finally {release.resolve();await Promise.allSettled([slow,duplicate]);}
+});
+
+test('pending input preparations reserve queue capacity and bound active downloads',async t=>{
+  const {bridge}=await fixture(t,{inputPreparationWorkers:1,maxQueue:2});
+  const entered=Promise.withResolvers(),release=Promise.withResolvers();let reads=0;
+  bridge.readInput=async(...args)=>{reads++;entered.resolve();await release.promise;return readReference(...args);};
+  const body={...request,mode:'m2v',references:[{type:'image',url:png}]};
+  const first=bridge.submit(body,'capacity-one',true);let second;
+  try {
+    await Promise.race([entered.promise,first.then(()=>assert.fail('input worker did not hold reference preparation'))]);
+    second=bridge.submit(body,'capacity-two',true);
+    await bridge.admissions;
+    await assert.rejects(bridge.submit(request,'capacity-overflow',true),e=>e.code==='active_queue_full');
+    assert.equal(reads,1,'second preparation must wait for its worker');
+    release.resolve();
+    await Promise.all([first,second]);
+    assert.equal(reads,2);assert.equal(bridge.jobs.size,2);
+    assert.equal(bridge.preparingUnits,0);
+  } finally {release.resolve();await Promise.allSettled([first,second]);}
+});
+
+test('failed input preparation cleans partial inputs and releases queue reservations',async t=>{
+  const {bridge,cfg}=await fixture(t,{inputPreparationWorkers:1,maxQueue:1});let reads=0;
+  bridge.readInput=async(...args)=>{if(++reads===2)throw Error('source signed URL secret');return readReference(...args);};
+  const body={...request,mode:'m2v',references:[{type:'image',url:png},{type:'image',url:png}]};
+  await assert.rejects(bridge.submit(body,'failed-preparation',true),/invalid or unavailable reference media/);
+  assert.equal(bridge.preparingUnits,0);assert.equal(bridge.pendingAdmissions.size,0);
+  const {readdir}=await import('node:fs/promises');
+  assert.equal((await readdir(cfg.dataDir)).some(name=>name.includes('-input-')),false);
+  const replacement=await bridge.submit(request,'replacement',true);
+  assert.equal(replacement.status,'queued');
+});
+
+test('shutdown drains active preparation and rejects queued preparation before reading it',async t=>{
+  const {bridge,cfg}=await fixture(t,{inputPreparationWorkers:1,maxQueue:2});
+  const entered=Promise.withResolvers(),release=Promise.withResolvers();let reads=0;
+  bridge.readInput=async(...args)=>{reads++;entered.resolve();await release.promise;return readReference(...args);};
+  const body={...request,mode:'m2v',references:[{type:'image',url:png}]};
+  const first=bridge.submit(body,'shutdown-one',true);let second,closing;
+  try {
+    await Promise.race([entered.promise,first.then(()=>assert.fail('input preparation did not enter worker'))]);
+    second=bridge.submit(body,'shutdown-two',true);
+    const settled=Promise.allSettled([first,second]);
+    await bridge.admissions;
+    closing=bridge.close();release.resolve();
+    const results=await settled;await closing;
+    assert.deepEqual(results.map(result=>result.status),['rejected','rejected']);
+    assert.equal(reads,1);assert.equal(bridge.jobs.size,0);assert.equal(bridge.preparingUnits,0);
+    const {readdir}=await import('node:fs/promises');
+    assert.equal((await readdir(cfg.dataDir)).some(name=>name.includes('-input-')),false);
+  } finally {release.resolve();await Promise.allSettled([first,second,closing]);}
 });

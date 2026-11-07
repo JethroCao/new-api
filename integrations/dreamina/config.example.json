@@ -6,6 +6,7 @@
   "space": "personal",
   "projectId": "YOUR_CANVAS_UUID",
   "canvasTaskLimit": 5,
+  "inputPreparationWorkers": 4,
   "dataDir": "/absolute/path/to/dreamina-bridge-data",
   "host": "127.0.0.1",
   "port": 8787,

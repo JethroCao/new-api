@@ -61,3 +61,107 @@ test('bounded multi-job reads are context isolated and do not alter terminal rec
  const found=await store.getMany([a.id,b.id,outside.id,randomUUID()]);assert.deepEqual(found,[a,b]);assert.deepEqual(await store.get(a.id),a);assert.deepEqual(await store.get(b.id),b);
  assert.deepEqual(await store.getMany([]),[]);await assert.rejects(store.getMany(Array(51).fill(a.id)),/batch/);
 });
+
+async function gatewayFixture(t) {
+ const dir=await mkdtemp(join(tmpdir(),'dreamina-gateway-db-'));
+ const url=process.env.DREAMINA_TEST_DATABASE_URL || 'sqlite://'+join(dir,'gateway.sqlite');
+ const store=await DatabaseStore.open({url,context:hash(randomUUID())});
+ await store.raw('CREATE TABLE IF NOT EXISTS tasks (task_id VARCHAR(191) NOT NULL, platform VARCHAR(30), channel_id INTEGER, status VARCHAR(20), private_data TEXT)');
+ const created=[];
+ const {GatewayTaskReader}=await import('./gateway-task-reader.mjs');
+ const reader=await GatewayTaskReader.open({url,channelId:1});
+ t.after(async()=>{await reader.close();for(const id of created)await store.raw('DELETE FROM tasks WHERE task_id=?',[id]);await store.close();await rm(dir,{recursive:true,force:true});});
+ async function insert(status='QUEUED',overrides={}) {
+  const candidate={id:randomUUID(),taskId:'task_'+randomUUID().replaceAll('-','')};
+  const row={platform:'dreamina-cli',channel_id:1,status,private_data:JSON.stringify({upstream_task_id:candidate.id,secret:'must-not-be-exposed'}),...overrides};
+  await store.raw('INSERT INTO tasks(task_id,platform,channel_id,status,private_data) VALUES(?,?,?,?,?)',[candidate.taskId,row.platform,row.channel_id,row.status,row.private_data]);
+  created.push(candidate.taskId);return candidate;
+ }
+ return {store,url,reader,insert};
+}
+
+test('gateway reader confirms only a unique matching nonterminal task and keeps private task data private',async t=>{
+ const {store,reader,insert}=await gatewayFixture(t);
+ const cases=[];
+ for(const status of ['NOT_START','SUBMITTED','QUEUED','IN_PROGRESS'])cases.push([await insert(status),'active']);
+ for(const status of ['SUCCESS','FAILURE'])cases.push([await insert(status),'terminal']);
+ for(const override of [{status:'UNKNOWN'},{channel_id:3},{platform:'doubao'},{private_data:'{}'},{private_data:'not-json'},{private_data:'null'},{private_data:JSON.stringify({upstream_task_id:randomUUID()})}])cases.push([await insert('QUEUED',override),'mismatch']);
+ cases.push([{id:randomUUID(),taskId:'task_missing'},'missing']);
+ const duplicate=await insert();
+ await store.raw('INSERT INTO tasks(task_id,platform,channel_id,status,private_data) VALUES(?,?,?,?,?)',[duplicate.taskId,'dreamina-cli',1,'QUEUED',JSON.stringify({upstream_task_id:duplicate.id})]);
+ cases.push([duplicate,'mismatch']);
+ const before=await store.raw('SELECT task_id,platform,channel_id,status,private_data FROM tasks ORDER BY task_id');
+ const found=await reader.inspect(cases.map(([c])=>c));
+ for(const [candidate,expected] of cases)assert.equal(found.get(candidate.id),expected);
+ assert.equal(JSON.stringify([...found]).includes('must-not-be-exposed'),false);
+ assert.deepEqual(await store.raw('SELECT task_id,platform,channel_id,status,private_data FROM tasks ORDER BY task_id'),before);
+ // Enforce read-only at the database connection as well as in our SELECT-only API.
+ if(reader.kind==='postgres')await assert.rejects(reader.connection.query('DELETE FROM tasks WHERE task_id=$1',[cases[0][0].taskId]),/read.only/i);
+ else if(reader.kind==='mysql')await assert.rejects(reader.connection.query('DELETE FROM tasks WHERE task_id=?',[cases[0][0].taskId]),/read.only/i);
+ else assert.throws(()=>reader.connection.prepare('DELETE FROM tasks WHERE task_id=?').run(cases[0][0].taskId),/readonly/i);
+ assert.deepEqual(await store.raw('SELECT task_id,platform,channel_id,status,private_data FROM tasks ORDER BY task_id'),before);
+ assert.deepEqual(await reader.inspect([]),new Map());
+ await assert.rejects(reader.inspect(Array(201).fill(cases[0][0])),/batch/);
+ await assert.rejects(reader.inspect([{id:randomUUID(),taskId:"task_'; DELETE FROM tasks;--"}]),/batch/);
+});
+
+test('gateway reader observes terminal changes on its next batch and refuses reads after close',async t=>{
+ const {store,reader,insert}=await gatewayFixture(t);
+ const candidate=await insert();
+ assert.equal((await reader.inspect([candidate])).get(candidate.id),'active');
+ await store.raw('UPDATE tasks SET status=? WHERE task_id=?',['FAILURE',candidate.taskId]);
+ assert.equal((await reader.inspect([candidate])).get(candidate.id),'terminal');
+ await reader.close();
+ await assert.rejects(reader.inspect([candidate]),e=>e.code==='gateway_database_unavailable'&&!e.message.includes('secret'));
+});
+
+test('gateway reader lazily connects without creating a missing SQLite database and can recover when it appears',async t=>{
+ const {GatewayTaskReader}=await import('./gateway-task-reader.mjs');
+ const {DatabaseSync}=await import('node:sqlite');
+ const {access}=await import('node:fs/promises');
+ const dir=await mkdtemp(join(tmpdir(),'dreamina-gateway-'));t.after(()=>rm(dir,{recursive:true,force:true}));
+ const path=join(dir,'gateway.sqlite');
+ const reader=await GatewayTaskReader.open({url:'sqlite://'+path,channelId:1});t.after(()=>reader.close());
+ const candidate={id:randomUUID(),taskId:'task_after_recovery'};
+ await assert.rejects(reader.inspect([candidate]),e=>e.code==='gateway_database_unavailable'&&!e.message.includes(path));
+ await assert.rejects(access(path));
+ const db=new DatabaseSync(path);t.after(()=>db.close());
+ db.exec('CREATE TABLE tasks(task_id TEXT, platform TEXT, channel_id INTEGER, status TEXT, private_data TEXT)');
+ db.prepare('INSERT INTO tasks VALUES(?,?,?,?,?)').run(candidate.taskId,'dreamina-cli',1,'QUEUED',JSON.stringify({upstream_task_id:candidate.id}));
+ assert.equal((await reader.inspect([candidate])).get(candidate.id),'active');
+ db.exec('DROP TABLE tasks');
+ await assert.rejects(reader.inspect([candidate]),e=>e.code==='gateway_database_unavailable');
+ db.exec('CREATE TABLE tasks(task_id TEXT, platform TEXT, channel_id INTEGER, status TEXT, private_data TEXT)');
+ assert.equal((await reader.inspect([candidate])).get(candidate.id),'missing');
+});
+
+
+test('gateway reader times out a blocked database query and reconnects after the lock is released',async t=>{
+ const {store,reader,insert}=await gatewayFixture(t);
+ if(store.kind==='sqlite'){t.skip('covered by the PostgreSQL/MySQL verification matrix');return;}
+ const candidate=await insert();
+ assert.equal((await reader.inspect([candidate])).get(candidate.id),'active');
+ if(store.kind==='postgres') {
+  await store.raw('BEGIN');await store.raw('LOCK TABLE tasks IN ACCESS EXCLUSIVE MODE');
+ } else await store.raw('LOCK TABLES tasks WRITE');
+ try {await assert.rejects(reader.inspect([candidate]),e=>e.code==='gateway_database_unavailable'&&e.message==='Gateway task confirmation is unavailable.');}
+ finally {await store.raw(store.kind==='postgres'?'ROLLBACK':'UNLOCK TABLES');}
+ assert.equal((await reader.inspect([candidate])).get(candidate.id),'active');
+});
+
+test('gateway SQLite lock contention fails closed and reconnects after release',async t=>{
+ const {GatewayTaskReader}=await import('./gateway-task-reader.mjs');
+ const {DatabaseSync}=await import('node:sqlite');
+ const dir=await mkdtemp(join(tmpdir(),'dreamina-gateway-lock-'));
+ const path=join(dir,'host.sqlite');const host=new DatabaseSync(path);
+ t.after(()=>rm(dir,{recursive:true,force:true}));t.after(()=>host.close());
+ host.exec('CREATE TABLE tasks(task_id TEXT,platform TEXT,channel_id INTEGER,status TEXT,private_data TEXT)');
+ const candidate={id:randomUUID(),taskId:'task_sqlite_locked'};
+ host.prepare('INSERT INTO tasks VALUES(?,?,?,?,?)').run(candidate.taskId,'dreamina-cli',1,'QUEUED',JSON.stringify({upstream_task_id:candidate.id}));
+ const reader=await GatewayTaskReader.open({url:'sqlite://'+path,channelId:1});t.after(()=>reader.close());
+ assert.equal((await reader.inspect([candidate])).get(candidate.id),'active');
+ host.exec('BEGIN EXCLUSIVE');
+ try {await assert.rejects(reader.inspect([candidate]),e=>e.code==='gateway_database_unavailable');}
+ finally {host.exec('ROLLBACK');}
+ assert.equal((await reader.inspect([candidate])).get(candidate.id),'active');
+});
