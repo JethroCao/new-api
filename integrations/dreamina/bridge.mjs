@@ -18,6 +18,8 @@ const hash = value => createHash('sha256').update(value).digest('hex');
 const failedOperationStates = new Set(['failed','cancelled','canceled','expired']);
 const isTerminalOperation = state => failedOperationStates.has(state) || state === 'succeeded' || state === 'completed';
 const terminal = job => ['completed', 'failed'].includes(job.status);
+// Keep the credit identity even when its persisted contract is damaged.
+const hasCreditBilling = job => Object.hasOwn(job, 'billing') || job.billingMode === 'credits';
 function fail(message, status = 400, code) { throw Object.assign(new Error(message), { status, code }); }
 function integer(value, min, max) { return Number.isSafeInteger(value) && value >= min && value <= max; }
 // Credential and workspace errors affect the worker, not an individual file.
@@ -676,7 +678,7 @@ export class Bridge {
     }
     return { id: j.id, object: j.request.kind === 'video' ? 'video' : 'image', model: j.request.model,
       status: j.status, created_at: j.created_at, completed_at: j.completed_at,
-      terminal_proof: isTerminalOperation(j.terminalOperationState),
+      ...(hasCreditBilling(j) || j.terminalOperationState !== undefined ? {terminal_proof: isTerminalOperation(j.terminalOperationState)} : {}),
       ...(j.billingResolutionExpiresAt ? {billing_unresolved: !j.upstreamCreditQuote, billing_resolution_expires_at: j.billingResolutionExpiresAt} : {}),
       // Historical jobs have no mode field. A saved credit contract always wins;
       // new credit jobs retain their identity even if their contract is damaged.
@@ -744,7 +746,7 @@ export class Bridge {
   }
 
   resumeUnverifiedCompletion(job) {
-    if (job.status !== 'completed' || !UUID.test(job.submitId || '')) return false;
+    if (!hasCreditBilling(job) || job.status !== 'completed' || !UUID.test(job.submitId || '')) return false;
     const missingQuote = job.billing && job.request.mode === 'promote' && !job.upstreamCreditQuote;
     if (isTerminalOperation(job.terminalOperationState) && !missingQuote) return false;
     if (missingQuote) job.billingResolutionExpiresAt ||= mediaDeadlines(job).content_expires_at ||
@@ -776,6 +778,9 @@ export class Bridge {
     if (job.status === 'completed' && this.inFlight.has(id)) await this.inFlight.get(id).promise;
     if (this.resumeUnverifiedCompletion(job)) await this.save(job);
     if (job.status !== 'completed') return this.get(id,job);
+    // Legacy completions predate terminal receipts and checksums. Preserve
+    // their original result without issuing new credit delivery evidence.
+    if (!hasCreditBilling(job)) return this.get(id,job);
     const expires = mediaDeadlines(job).content_expires_at;
     if (expires && Date.now() >= expires * 1000) return {...this.get(id,job),delivery_verified:false};
     // Historical records without a submission identity remain downloadable,

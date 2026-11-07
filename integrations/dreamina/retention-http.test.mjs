@@ -2,6 +2,7 @@ import {createHash} from 'node:crypto';
 import {test} from 'node:test';import assert from 'node:assert/strict';
 import {mkdtemp,rm,writeFile,readFile,stat} from 'node:fs/promises';import {join} from 'node:path';import {tmpdir} from 'node:os';
 import {Bridge,validateConfig,createServer} from './bridge.mjs';import * as plugin from './plugin.js';
+import {buildCreditPlugin} from './build-credit-plugin.mjs';
 const id='11111111-1111-4111-8111-111111111111',token='retention-http-test-key-longer-than-32';const video=Buffer.from('000000186674797069736f6d0000020069736f6d','hex');
 async function fixture(t){
  const dir=await mkdtemp(join(tmpdir(),'retention-http-'));t.after(()=>rm(dir,{recursive:true,force:true}));
@@ -27,6 +28,31 @@ test('unexpired output remains downloadable and exposes the exact retention dead
  const {bridge,j,url}=await fixture(t);t.mock.timers.enable({apis:['Date'],now:(100000+28800)*1000-1});
  const r=await fetch(url+'/v1/jobs/'+id+'/content/0',{headers:{Authorization:'Bearer '+token,Range:'bytes=0-7'}});assert.equal(r.status,206);assert.deepEqual(Buffer.from(await r.arrayBuffer()),video.subarray(0,8));
  assert.equal(bridge.get(id,j).content_expires_at,128800);assert.equal(bridge.get(id,j).content_expired,false);
+});
+test('historical completed jobs with submission IDs keep their files and seconds settlement without new billing proof',async t=>{
+ const creditPlugin=await import('data:text/javascript;base64,'+Buffer.from(await buildCreditPlugin({models:['seedance_2.5']})).toString('base64'));
+ for(const knownTerminal of [false,true])await t.test(knownTerminal?'known terminal without checksum':'old terminal without proof or checksum',async t=>{
+  const {bridge,j,dir}=await fixture(t);t.mock.timers.enable({apis:['Date'],now:100001000});
+  j.submitId='22222222-2222-4222-8222-222222222222';
+  Object.assign(j.request,{mode:'t2v',ratio:'16:9',resolution:'720p'});
+  if(knownTerminal)j.terminalOperationState='succeeded';
+  await bridge.save(j);const saved=await readFile(join(dir,id+'.json'),'utf8');await bridge.close();
+  const calls=[];
+  const reopened=await Bridge.open(bridge.config,async args=>{calls.push(args);throw Error('historical completion must not call the CLI');});t.after(()=>reopened.close());
+  const server=createServer(reopened);await new Promise(r=>server.listen(0,'127.0.0.1',r));t.after(()=>new Promise(r=>server.close(r)));
+  const url='http://127.0.0.1:'+server.address().port+'/v1/jobs/'+id,headers={Authorization:'Bearer '+token};
+  const response=await fetch(url,{headers});assert.equal(response.status,200);const receipt=await response.json();
+  assert.equal(receipt.status,'completed');assert.equal(receipt.video_count,1);assert.equal(receipt.billing_mode,'legacy_seconds');
+  assert.equal(receipt.terminal_proof,knownTerminal?true:undefined);assert.equal(receipt.delivery_verified,undefined);assert.equal(receipt.billing,undefined);
+  const previous={id,object:'video',model:'dreamina-video',seconds:5,n:1,mode:'t2v',ratio:'16:9',resolution:'720p',status:'in_progress'};
+  const poll={taskId:id,publicTaskId:'task_legacy',data:previous,state:null};
+  const parsed=creditPlugin.parseTaskResult(poll,receipt,{status:200});assert.equal(parsed.status,'SUCCESS');
+  assert.deepEqual(creditPlugin.extractUsageOnComplete(poll,parsed,receipt),{seconds:5});assert.equal(parsed.state?.settledCredits,undefined);
+  const head=await fetch(url+'/content/0',{method:'HEAD',headers});assert.equal(head.status,200);assert.equal(head.headers.get('content-length'),String(video.length));
+  const range=await fetch(url+'/content/0',{headers:{...headers,Range:'bytes=0-7'}});assert.equal(range.status,206);assert.deepEqual(Buffer.from(await range.arrayBuffer()),video.subarray(0,8));
+  await reopened.processJob(await reopened.loadJob(id));await reopened.tick();
+  assert.deepEqual(calls,[]);assert.deepEqual((await reopened.loadJob(id)).files,j.files);assert.equal(await readFile(join(dir,id+'.json'),'utf8'),saved);
+ });
 });
 test('plugin renders expiry for new and historical completed snapshots and never changes task status',()=>{
  const d={object:'video',status:'completed',completed_at:100000,video_count:1,seconds:5};const task={status:'SUCCESS',data:d};

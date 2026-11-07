@@ -629,6 +629,24 @@ test('a pending pre-upgrade download checkpoint rechecks its original operation 
   assert.equal(calls.some(args=>args[0]==='resource'||args[1]==='run'),false);
 });
 
+test('an active legacy task still polls, downloads and settles seconds after restart',async t=>{
+  const {bridge,cfg,cli,calls}=await fixture(t,{canvasTaskLimit:0});
+  const job=bridge.jobs.get((await bridge.submit(request,'active-legacy')).id);
+  job.status='in_progress';delete job.billingMode;
+  const previous=bridge.get(job.id);delete previous.billing_mode;delete previous.terminal_proof;
+  await bridge.save(job);await bridge.close();calls.length=0;
+  const restored=await Bridge.open(cfg,cli);t.after(()=>restored.close());
+  await restored.tick();await restored.tick();
+  const receipt=await restored.observe(job.id);
+  assert.equal(receipt.status,'completed');assert.equal(receipt.billing_mode,'legacy_seconds');assert.equal(receipt.video_count,1);
+  const creditPlugin=await import('data:text/javascript;base64,'+Buffer.from(await buildCreditPlugin({models:['seedance_2.5']})).toString('base64'));
+  const poll={taskId:job.id,publicTaskId:'active-legacy',data:previous,state:null};
+  const parsed=creditPlugin.parseTaskResult(poll,receipt,{status:200});
+  assert.equal(parsed.status,'SUCCESS');assert.deepEqual(creditPlugin.extractUsageOnComplete(poll,parsed,receipt),{seconds:5});
+  assert.equal(calls.filter(args=>args[0]==='operation').length,1);assert.equal(calls.filter(args=>args[1]==='download').length,1);
+  assert.equal(calls.some(args=>args[1]==='run'),false);
+});
+
 test('a failed terminal receipt without child outcomes cannot publish a provisional success', async t=>{
   let phase=0;
   const {bridge,calls}=await fixture(t,{canvasTaskLimit:0}, async args=>{
@@ -691,12 +709,12 @@ test('the final resource order replaces the order in which provisional outputs b
   assert.equal(job.status,'completed');assert.deepEqual(job.files.map(f=>f.resourceId),['first','second']);
 });
 
-test('a pre-upgrade completed job must revalidate its original terminal outcome before a new receipt',async t=>{
+test('a completed credit job must revalidate its original terminal outcome before a new receipt',async t=>{
   const {bridge,cfg,cli,calls}=await fixture(t,{canvasTaskLimit:0},async args=>{
     if(args[0]==='operation')return {operationRef:args[2],state:'failed',resources:[{resourceId:'provisional',state:'failed',serviceCode:20115}]};
     throw Error('must not generate or download a revoked provisional output');
   });
-  const job=bridge.jobs.get((await bridge.submit(request,'upgrade-completed')).id);
+  const job=bridge.jobs.get((await bridge.submit(request,'upgrade-completed',false,{version:2,request_id:'upgrade-completed',reserved_credits:100})).id);
   job.status='completed';job.completed_at=Math.floor(Date.now()/1000);job.downloadResources=['provisional'];
   job.files=[{resourceId:'provisional',filename:job.id+'-0.bin',size:mp4.length,mime:'video/mp4',sha256:createHash('sha256').update(mp4).digest('hex')}];
   await writeFile(join(cfg.dataDir,job.files[0].filename),mp4);await bridge.save(job);await bridge.close();
@@ -767,13 +785,15 @@ test('missing promotion quotes recover only from the original operation or expir
   });
 });
 
-test('completed receipts detect missing or equal-size corrupt media and repair the original download',async t=>{
-  for(const missing of [false,true])await t.test(missing?'missing':'same size corruption',async t=>{
+test('completed credit receipts detect missing, corrupt or unverified media and repair the original download',async t=>{
+  for(const damage of ['missing','same size corruption','missing checksum'])await t.test(damage,async t=>{
     const {bridge,cfg,calls}=await fixture(t,{canvasTaskLimit:0});
-    const job=bridge.jobs.get((await bridge.submit(request,'delivery-repair')).id);
+    const job=bridge.jobs.get((await bridge.submit(request,'delivery-repair',false,{version:2,request_id:'delivery-repair',reserved_credits:100})).id);
     for(let i=0;i<3;i++)await bridge.processJob(job);
     assert.equal(job.status,'completed');const path=join(cfg.dataDir,job.files[0].filename);
-    if(missing)await rm(path);else await writeFile(path,Buffer.alloc(mp4.length));
+    if(damage==='missing')await rm(path);
+    else if(damage==='missing checksum')delete job.files[0].sha256;
+    else await writeFile(path,Buffer.alloc(mp4.length));
     const pending=await bridge.observe(job.id);
     assert.equal(pending.status,'in_progress');assert.equal(pending.video_count,0);
     await bridge.processJob(job);const repaired=await bridge.observe(job.id);
@@ -785,7 +805,7 @@ test('completed receipts detect missing or equal-size corrupt media and repair t
 test('a receipt cannot certify delivery when retention expires during file verification',async t=>{
   t.mock.timers.enable({apis:['Date'],now:100000000});
   const {bridge}=await fixture(t,{canvasTaskLimit:0});
-  const job=bridge.jobs.get((await bridge.submit(request,'expires-during-proof')).id);
+  const job=bridge.jobs.get((await bridge.submit(request,'expires-during-proof',false,{version:2,request_id:'expires-during-proof',reserved_credits:100})).id);
   for(let i=0;i<3;i++)await bridge.processJob(job);
   const expires=bridge.get(job.id).content_expires_at;
   t.mock.timers.setTime(expires*1000-1);
