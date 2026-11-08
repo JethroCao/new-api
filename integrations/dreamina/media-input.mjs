@@ -49,7 +49,7 @@ export function detectInput(bytes, type) {
   throw new Error('Reference bytes do not match a supported '+type+' format');
 }
 
-export async function readReference(ref, limit, signal = AbortSignal.timeout(30000)) {
+export async function readReference(ref, limit, signal = AbortSignal.timeout(60_000), reserveBytes) {
   signal.throwIfAborted();
   let bytes;
   if(ref.url.startsWith('data:')) {
@@ -57,6 +57,7 @@ export async function readReference(ref, limit, signal = AbortSignal.timeout(300
     if(!match || match[1].split('/')[0]!==ref.type || match[2].length%4!==0 || match[2].length>Math.ceil(limit/3)*4) throw new Error('Invalid reference data URL or size');
     bytes=Buffer.from(match[2],'base64');
     if(bytes.toString('base64')!==match[2]) throw new Error('Invalid reference base64');
+    reserveBytes?.(bytes.length);
   } else {
     let url = new URL(ref.url);
     for(let hop=0;hop<5;hop++) {
@@ -65,10 +66,21 @@ export async function readReference(ref, limit, signal = AbortSignal.timeout(300
         const req=request(url,{signal,agent:false,headers:{Accept:'*/*'},lookup:(host,options,callback)=>{
           if(options.all) callback(null,[{address,family:4}]);else callback(null,address,4);
         }},res=>{
-          if([301,302,303,307,308].includes(res.statusCode)) { const redirect=res.headers.location;res.resume();resolve({redirect});return; }
+          if([301,302,303,307,308].includes(res.statusCode)) { const redirect=res.headers.location;res.destroy();resolve({redirect});return; }
           if(res.statusCode!==200 || Number(res.headers['content-length'])>limit || res.headers['content-encoding'] && res.headers['content-encoding']!=='identity') {res.destroy();reject(new Error('Reference download rejected'));return;}
           const chunks=[];let size=0;
-          res.on('data',chunk=>{size+=chunk.length;if(size>limit){res.destroy(new Error('Reference size exceeds limit'));}else chunks.push(chunk);});
+          res.on('data',chunk=>{
+            size+=chunk.length;
+            try {
+              if (size>limit) throw new Error('Reference size exceeds limit');
+              reserveBytes?.(chunk.length);
+            } catch (error) {
+              reject(error);
+              res.destroy();
+              return;
+            }
+            chunks.push(chunk);
+          });
           res.on('end',()=>resolve({bytes:Buffer.concat(chunks)}));res.on('error',reject);
         });
         req.on('error',()=>reject(new Error('Reference download failed')));req.end();

@@ -1,6 +1,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtemp,rm,readFile,writeFile} from 'node:fs/promises';
+import {mkdtemp,readdir,rm,readFile,writeFile} from 'node:fs/promises';
+import {setImmediate} from 'node:timers/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {createHash,randomUUID} from 'node:crypto';
@@ -864,16 +865,112 @@ test('pending input preparations reserve queue capacity and bound active downloa
   } finally {release.resolve();await Promise.allSettled([first,second]);}
 });
 
-test('failed input preparation cleans partial inputs and releases queue reservations',async t=>{
-  const {bridge,cfg}=await fixture(t,{inputPreparationWorkers:1,maxQueue:1});let reads=0;
-  bridge.readInput=async(...args)=>{if(++reads===2)throw Error('source signed URL secret');return readReference(...args);};
-  const body={...request,mode:'m2v',references:[{type:'image',url:png},{type:'image',url:png}]};
-  await assert.rejects(bridge.submit(body,'failed-preparation',true),/invalid or unavailable reference media/);
+test('one request downloads at most three references at a time and keeps input order',async t=>{
+  const {bridge,cfg}=await fixture(t);
+  const images=Array.from({length:4},(_,index)=>Buffer.concat([
+    Buffer.from(png.split(',')[1],'base64'),Buffer.from([index]),
+  ]));
+  const references=images.map(bytes=>({type:'image',url:'data:image/png;base64,'+bytes.toString('base64')}));
+  const releases=images.map(()=>Promise.withResolvers());
+  const entered=images.map(()=>Promise.withResolvers());
+  const started=[];
+  bridge.readInput=async(ref,...args)=>{
+    const index=references.findIndex(item=>item.url===ref.url);
+    started.push(index);
+    entered[index].resolve();
+    await releases[index].promise;
+    return readReference(ref,...args);
+  };
+  const pending=bridge.submit({...request,mode:'m2v',references},'ordered-inputs',true);
+  try {
+    await entered[0].promise;
+    assert.deepEqual(started,[0,1,2]);
+    releases[2].resolve();
+    await entered[3].promise;
+    assert.deepEqual(started,[0,1,2,3]);
+    releases[3].resolve();
+    releases[1].resolve();
+    releases[0].resolve();
+    const job=bridge.jobs.get((await pending).id);
+    const files=await Promise.all(job.inputs.map(input=>readFile(join(cfg.dataDir,input.filename))));
+    assert.deepEqual(files,images);
+  } finally {
+    for(const release of releases) release.resolve();
+    await Promise.allSettled([pending]);
+  }
+});
+
+test('failed input preparation cancels sibling downloads, cleans files and releases reservations',{timeout:5000},async t=>{
+  const {bridge,cfg}=await fixture(t,{inputPreparationWorkers:1,maxQueue:1});
+  const failDownload=Promise.withResolvers(), releaseSibling=Promise.withResolvers();
+  let reads=0, siblingAborted=false;
+  bridge.readInput=async(ref,limit,signal,...rest)=>{
+    switch(++reads) {
+      case 2:
+        await releaseSibling.promise;
+        siblingAborted=signal.aborted;
+        return readReference(ref,limit,signal,...rest);
+      case 3:
+        await failDownload.promise;
+        throw Error('source signed URL secret');
+      default:
+        return readReference(ref,limit,signal,...rest);
+    }
+  };
+  const body={...request,mode:'m2v',references:Array.from({length:3},()=>({type:'image',url:png}))};
+  const pending=bridge.submit(body,'failed-preparation',true);
+  try {
+    // Wait until the first successful input has reached disk.
+    while (!(await readdir(cfg.dataDir)).some(name=>name.includes('-input-'))) await setImmediate();
+    assert.equal(reads,3);
+    failDownload.resolve();
+    await setImmediate();
+    releaseSibling.resolve();
+    await assert.rejects(pending,{message:'invalid or unavailable reference media'});
+    assert.equal(siblingAborted,true);
+  } finally {
+    failDownload.resolve();
+    releaseSibling.resolve();
+    await Promise.allSettled([pending]);
+  }
   assert.equal(bridge.preparingUnits,0);assert.equal(bridge.pendingAdmissions.size,0);
-  const {readdir}=await import('node:fs/promises');
   assert.equal((await readdir(cfg.dataDir)).some(name=>name.includes('-input-')),false);
   const replacement=await bridge.submit(request,'replacement',true);
   assert.equal(replacement.status,'queued');
+});
+
+test('parallel inputs still share the per-request byte limit',async t=>{
+  const bytes=Buffer.from(png.split(',')[1],'base64').length;
+  const {bridge,cfg}=await fixture(t,{maxInputBytes:2*bytes});
+  const references=Array.from({length:3},()=>({type:'image',url:png}));
+  await assert.rejects(bridge.submit({...request,mode:'m2v',references},'oversized-inputs',true),
+    {message:'invalid or unavailable reference media'});
+  assert.equal((await readdir(cfg.dataDir)).some(name=>name.includes('-input-')),false);
+});
+
+test('the 60-second deadline aborts all downloads in one request',async t=>{
+  const {bridge,cfg}=await fixture(t);
+  const deadline=new AbortController(), entered=Promise.withResolvers();
+  let timeoutMs;
+  const signals=[];
+  t.mock.method(AbortSignal,'timeout',ms=>{
+    timeoutMs=ms;
+    return deadline.signal;
+  });
+  bridge.readInput=async(_ref,_limit,signal)=>{
+    signals.push(signal);
+    entered.resolve();
+    await new Promise((_,reject)=>signal.addEventListener('abort',()=>reject(signal.reason),{once:true}));
+  };
+  const references=Array.from({length:3},()=>({type:'image',url:png}));
+  const pending=bridge.submit({...request,mode:'m2v',references},'input-deadline',true);
+  await entered.promise;
+  deadline.abort();
+  await assert.rejects(pending,{message:'invalid or unavailable reference media'});
+  assert.equal(timeoutMs,60000);
+  assert.equal(signals.length,3);
+  assert.ok(signals.every(signal=>signal.aborted));
+  assert.equal((await readdir(cfg.dataDir)).some(name=>name.includes('-input-')),false);
 });
 
 test('shutdown drains active preparation and rejects queued preparation before reading it',async t=>{

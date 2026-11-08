@@ -596,19 +596,44 @@ export class Bridge {
         if (this.closed) fail('bridge closed',503);
         this.recordTime(job,'input_preparation_started_at_ms');
         let remaining = this.config.maxInputBytes;
-        const inputDeadline = AbortSignal.timeout(30000);
-        for (const ref of request.references) {
-          if (this.closed) fail('bridge closed',503);
-          let media;
-          try { media = await this.readInput(ref,remaining,inputDeadline); } catch { fail('invalid or unavailable reference media'); }
-          if (this.closed) fail('bridge closed',503);
-          remaining -= media.bytes.length;
-          const resourceId = randomUUID(), filename = job.id + '-input-' + job.inputs.length + '.' + media.extension;
-          // Track before writing so a failed write also removes the partial file.
-          job.inputs.push({resourceId,filename,type:ref.type,sha256:hash(media.bytes),uploaded:false});
-          const file = await open(join(this.config.dataDir,filename),'wx',0o600);
-          try { await file.writeFile(media.bytes); await file.sync(); } finally { await file.close(); }
+        const cancellation = new AbortController();
+        const signal = AbortSignal.any([AbortSignal.timeout(60_000),cancellation.signal]);
+        const reserveBytes = size => {
+          if (size > remaining) throw new Error('Reference size exceeds request limit');
+          remaining -= size;
+        };
+        let nextReference = 0;
+        const prepareReferences = async () => {
+          while (!signal.aborted && nextReference < request.references.length) {
+            if (this.closed) fail('bridge closed',503);
+            const index = nextReference++;
+            const ref = request.references[index];
+            let media;
+            try {
+              media = await this.readInput(ref,remaining,signal,reserveBytes);
+              signal.throwIfAborted();
+            } catch {
+              fail('invalid or unavailable reference media');
+            }
+            if (this.closed) fail('bridge closed',503);
+            const resourceId = randomUUID();
+            const filename = job.id + '-input-' + index + '.' + media.extension;
+            // Keep request order and track partial files before writing.
+            job.inputs[index] = {resourceId,filename,type:ref.type,sha256:hash(media.bytes),uploaded:false};
+            const file = await open(join(this.config.dataDir,filename),'wx',0o600);
+            try { await file.writeFile(media.bytes); await file.sync(); } finally { await file.close(); }
+          }
+        };
+        const workers = Array.from({length:Math.min(3,request.references.length)},prepareReferences);
+        try {
+          await Promise.all(workers);
+        } catch (error) {
+          cancellation.abort();
+          // No worker can create another file after admission cleanup starts.
+          await Promise.allSettled(workers);
+          throw error;
         }
+        if (signal.aborted) fail('invalid or unavailable reference media');
         this.recordTime(job,'input_preparation_completed_at_ms');
       }
       // Signed URLs and base64 never enter durable snapshots.
@@ -641,7 +666,7 @@ export class Bridge {
       return await commit;
     } catch(error) {
       // A lost commit response may mean the snapshot is already durable.
-      if(!saving)for(const input of job.inputs)await unlink(join(this.config.dataDir,input.filename)).catch(()=>{});
+      if (!saving) for (const input of Object.values(job.inputs)) await unlink(join(this.config.dataDir,input.filename)).catch(()=>{});
       throw error;
     } finally {
       if(preparing) {
