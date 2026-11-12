@@ -68,5 +68,6 @@
   "catalogTTLms": 60000,
   "storage": "database",
   "migrateLegacy": false,
-  "canvasChannel": "A"
+  "canvasChannel": "A",
+  "ossWorkers": 2
 }

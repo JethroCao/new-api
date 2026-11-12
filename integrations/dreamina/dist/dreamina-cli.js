@@ -186,7 +186,7 @@ function seconds_parseTaskResult(ctx, body, response) {
   // Existing task log/details fields support text, so abnormal tasks need not
   // masquerade as a fixed 30% progress value or require a new gateway status.
   const action=body && body.recovery && body.recovery.action;
-  const progress={manual_review:'提交状态待核查',retry_query:'查询异常，正在重查',retry_download:'正在获取视频'};
+  const progress={manual_review:'提交状态待核查',retry_query:'查询异常，正在重查',retry_download:'正在获取视频',retry_upload:'正在上传视频'};
   if(progress[action])result.progress=progress[action];
   if (status==='UNKNOWN') result.reason='Unrecognized bridge task status';
   return result;
@@ -213,10 +213,14 @@ export function buildContentRequest(ctx) {
 }
 export const protocols={openai_video:{decodeRequest:decode,render:function(ctx,task){
   const d=task.data||{}, result={};
-  if(task.status==='SUCCESS'&&d.object==='video'){
+  if(task.status==='SUCCESS'&&d.object==='video'&&d.storage!=='oss'){
     const downloaded=Number.isSafeInteger(d.timings&&d.timings.download_completed_at_ms)&&d.timings.download_completed_at_ms>0?Math.floor(d.timings.download_completed_at_ms/1000):d.completed_at;
     const expires=Number.isSafeInteger(d.content_expires_at)&&d.content_expires_at>0?d.content_expires_at:Number.isSafeInteger(downloaded)&&downloaded>0?downloaded+28800:undefined;
     if(expires){result.content_expires_at=expires;result.content_expired=Date.now()>=expires*1000;}
+  }
+  if(task.status==='SUCCESS' && d.storage==='oss' && Array.isArray(d.video_urls) && d.video_urls.length) {
+    result.storage='oss';result.video_url=d.video_urls[0];result.video_urls=d.video_urls.slice();
+    result.download_url_expires_at=d.download_url_expires_at;
   }
   for (const key of ['seconds','n','resolution','ratio','mode','warning']) if(d[key]!==undefined) result[key]=d[key];
   if(d.video_count!==undefined) result.video_count=task.status==='SUCCESS'?d.video_count:0;
@@ -232,7 +236,7 @@ export const protocols={openai_video:{decodeRequest:decode,render:function(ctx,t
     return {...result,phase:'needs_attention',recovery:{action:'manual_review',
       message:'任务状态待核查，请稍后查询',automatic_resubmit:false}};
   }
-  if(d.recovery && ['wait','completed','manual_review','retry_query','retry_download','add_credits_then_resubmit','fix_input_then_resubmit','review_failure','resubmit'].includes(d.recovery.action)) {
+  if(d.recovery && ['wait','completed','manual_review','retry_query','retry_download','retry_upload','add_credits_then_resubmit','fix_input_then_resubmit','review_failure','resubmit'].includes(d.recovery.action)) {
     result.recovery={action:d.recovery.action,message:String(d.recovery.message || '').slice(0,4096),automatic_resubmit:false};
   }
   if(d.phase)result.phase=d.phase;
@@ -256,7 +260,7 @@ export const protocols={openai_video:{decodeRequest:decode,render:function(ctx,t
 // Generated credit variant; rebuild with build-credit-plugin.mjs.
 const CREDIT_MODELS=["seedance_2.5","seedance_2.5_draft","seedance_2.0_vip","seedance_2.0_fast_vip","seedance_2.0_mini","seedance_pro_fast","happyhorse_1.1","wan_3.0"];
 // Appended to the shared, self-contained protocol by build-credit-plugin.mjs.
-meta.version='1.3.1';
+meta.version='1.4.0';
 meta.models=CREDIT_MODELS.concat(CREDIT_MODELS.includes('seedance_2.5')?['dreamina-video']:[]);
 meta.usageSchema={
  credits:{type:'number',unit:'credit',description:{en:'Dreamina credit unit price',zh:'即梦积分单价'}},

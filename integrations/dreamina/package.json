@@ -11,6 +11,7 @@
     "check": "node server.mjs --check"
   },
   "dependencies": {
+    "ali-oss": "6.23.0",
     "mysql2": "3.24.6",
     "pg": "8.23.1"
   }

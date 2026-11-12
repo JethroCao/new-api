@@ -9,7 +9,8 @@ export function mediaDeadlines(job){
  const completed=timestamp(job.completed_at),downloaded=timestamp(job.timings?.download_completed_at_ms);
  const delivered=downloaded?Math.floor(downloaded/1000):completed;
  const end=completed||(job.status==='completed'?delivered:undefined);
- return {...(end?{input_expires_at:end+MEDIA_RETENTION_SECONDS}:{}),...(job.status==='completed'&&delivered?{content_expires_at:Math.min(delivered+MEDIA_RETENTION_SECONDS,timestamp(job.deliveryExpiresAt)||Infinity)}:{})};
+ const remote=job.outputStorage?.status==='ready';
+ return {...(remote && delivered?{local_content_expires_at:delivered+MEDIA_RETENTION_SECONDS}:{}),...(end?{input_expires_at:end+MEDIA_RETENTION_SECONDS}:{}),...(!remote&&job.status==='completed'&&delivered?{content_expires_at:Math.min(delivered+MEDIA_RETENTION_SECONDS,timestamp(job.deliveryExpiresAt)||Infinity)}:{})};
 }
 export async function cleanupMedia({dataDir,loadJobs,isBusy=()=>false,now=Date.now(),onError=()=>{},remove=unlink}){
  const groups=new Map();
@@ -28,7 +29,7 @@ export async function cleanupMedia({dataDir,loadJobs,isBusy=()=>false,now=Date.n
     const input=(job.inputs||[]).some(f=>f.filename===name);
     const output=(job.files||[]).some(f=>f.filename===name);
     const partial=Array.from({length:Number.isSafeInteger(job.request?.n)&&job.request.n<=4?job.request.n:0},(_,i)=>id+'-'+i+'.bin.part').includes(name);
-    const expires=output?(deadlines.content_expires_at||deadlines.input_expires_at):input||partial?deadlines.input_expires_at:undefined;
+    const expires=output?(deadlines.local_content_expires_at||deadlines.content_expires_at||deadlines.input_expires_at):input||partial?deadlines.input_expires_at:undefined;
     if(!expires||now<expires*1000||isBusy(id))continue;
     try{
      const path=join(dataDir,name),info=await lstat(path);if(!info.isFile())continue;

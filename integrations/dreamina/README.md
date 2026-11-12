@@ -4,7 +4,7 @@ This integration targets official commit `9c2c370a6156b3ac41874231952a938891ac54
 
 ## Components and installation
 
-- `dist/dreamina-cli.js`: uploadable API v1 credit-billing plugin, key `dreamina-cli`, version `1.3.1`. Install through the official task-plugin management API or UI and select it on the bridge channel.
+- `dist/dreamina-cli.js`: uploadable API v1 credit-billing plugin, key `dreamina-cli`, version `1.4.0`. Install through the official task-plugin management API or UI and select it on the bridge channel.
 - `plugin.js`: shared protocol/legacy seconds implementation used by the generator. **Do not upload this source as the credit-billing release.**
 - `bridge.mjs` / `server.mjs`: independent Node.js service running the Canvas CLI; A and B each use their own profile, account/team binding, database context and media directory.
 - `standard-credit-pricing.json`: explicit normal-group price configuration, not host defaults. Its historical 70% benchmark is dated 2026-10-29; it is not a newly checked official price list. Kemeng pricing is outside this configuration.
@@ -40,6 +40,42 @@ Optional fast startup confirms that the host has persisted the task instead of w
 The bridge reads only its queued task IDs in one indexed batch (up to 200) each second, matching `task_id`, `platform=dreamina-cli`, `channel_id`, `private_data.upstream_task_id` and a recognized active status. Unknown/malformed/duplicate or mismatched rows never grant startup. Database confirmations last five seconds and are rechecked during preparation; they are not restored after restart. Confirmed terminal or mismatched rows block dispatch even if an earlier status poll had granted a lease. Query failures back off to at most 30 seconds and existing authenticated host polls remain the fallback. Slow confirmation does not stop polling or downloading already accepted jobs. Once an operation has been dispatched, its existing recovery rules continue to apply; confirmation never resubmits it.
 
 This is a read of official task persistence, not a receipt of completed billing: the unchanged host still inserts before its initial billing settlement. It reduces the orphan-submission window without providing an atomic transaction with the upstream. The reader depends on the official task schema and must be revalidated when upgrading New API. New `gatewayTaskId` and preparation/confirmation timings live only in bridge records. Legacy queued credit jobs use their existing private `billing.request_id`; older jobs without a public ID use normal polling. Plugin release and billing expressions do not change for this optimization.
+
+## Optional private OSS video delivery
+
+OSS is opt-in and affects only new video admissions. Existing jobs keep their original local delivery and retention; no backfill or official schema changes are performed. Add this configuration to the bridge operator's JSON on each CLI machine:
+
+```json
+{
+  "ossWorkers": 2,
+  "oss": {
+    "bucket": "nexora-media-prod",
+    "region": "oss-cn-hangzhou",
+    "prefix": "prod/videos",
+    "internal": true,
+    "signedUrlSeconds": 86400
+  }
+}
+```
+
+Provide `DREAMINA_OSS_ACCESS_KEY_ID` and `DREAMINA_OSS_ACCESS_KEY_SECRET` through the protected service environment, never the JSON config, plugin source or request body. Use a private Standard-storage bucket. The uploader uses OSS V4 signatures and a private object ACL; the existing RAM object permissions (`oss:PutObject`, `oss:GetObject`, `oss:DeleteObject` on this bucket only) suffice for the upload/read operations. No object listing or bucket management operation is performed. This integration never deletes OSS objects; the DeleteObject grant is not exercised. Ensure no existing bucket lifecycle rule expires this prefix if long-term retention is required. `internal: true` uses the Hangzhou internal endpoint for upload/verification; signed client URLs always use the public HTTPS endpoint. A laptop outside that VPC needs `internal: false` for a separately authorized live upload test. `--check` validates configuration/credentials locally, but does not upload an OSS test object or prove RAM permissions.
+
+Each job freezes its destination at admission. The existing adapter job JSON stores the output index and `files[].oss` (`bucket`, `region`, `key`, byte length, SHA-256 and upload time). Object keys are `prod/videos/YYYY/MM/DD/<public-task-id>/outputs/001.mp4` (UTC date; adapter job UUID is used when no public task ID exists). The adapter uploads only verified successful outputs, persists each upload checkpoint, then signs all URLs before reporting completion. SHA-256 metadata and length are checked with HEAD; Content-MD5 validates the PUT payload. A lost upload response is recovered with HEAD instead of uploading again. Upload failures remain in progress with `retry_upload`, use a separate bounded worker lane (default 2, allowed 1–4), and back off to 60 seconds without regenerating. The unchanged host's overall task timeout still applies; prolonged OSS outages must be handled operationally before that deadline.
+
+`GET /v1/videos/{task_id}` adds these fields for successful OSS jobs:
+
+```json
+{
+  "storage": "oss",
+  "video_url": "https://<bucket>.oss-cn-hangzhou.aliyuncs.com/<object>?<signature>",
+  "video_urls": ["https://<bucket>.oss-cn-hangzhou.aliyuncs.com/<object>?<signature>"],
+  "download_url_expires_at": 1794460800
+}
+```
+
+`video_url` is the first delivered output; `video_urls` contains all delivered outputs in the same order as artifact keys (`video`, `video-2`, ...). The timestamp is Unix seconds. **These are fixed signed snapshots persisted in the task result, valid for 24 hours by default from signing, not from each query.** The official renderer does not perform network I/O or refresh terminal tasks. Repeated queries return the same links, including after expiry. Download and retain a copy within that window; after expiry, the original authenticated `/content`/artifact download endpoints still work by obtaining a fresh server-side OSS signature. No new public route or host renderer is introduced. A URL is a bearer credential for its validity window: do not publish task responses or access-log query strings. The durable object identity is the bucket/key, not the signature snapshot.
+
+References stay local. Local successful outputs retain their existing fixed eight-hour deadline measured from original download completion, but cleanup only removes them after OSS is ready; pending uploads remain protected. Inputs retain the existing eight-hour terminal-task cleanup. OSS objects and task associations remain after local cleanup. There is no eight-hour `content_expires_at` on OSS results. The old proxy download supports GET, HEAD and Range after local cleanup, forwarding no bridge credentials to OSS. Keep the configured bucket and region available for historical downloads; changing destination does not migrate old objects. A signed snapshot that expires before a severely delayed host terminal poll cannot be refreshed by repeated task queries: use `/content` instead.
 
 ## Billing and compatibility
 

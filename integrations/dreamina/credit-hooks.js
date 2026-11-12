@@ -1,5 +1,5 @@
 // Appended to the shared, self-contained protocol by build-credit-plugin.mjs.
-meta.version='1.3.1';
+meta.version='1.4.0';
 meta.models=CREDIT_MODELS.concat(CREDIT_MODELS.includes('seedance_2.5')?['dreamina-video']:[]);
 meta.usageSchema={
  credits:{type:'number',unit:'credit',description:{en:'Dreamina credit unit price',zh:'即梦积分单价'}},

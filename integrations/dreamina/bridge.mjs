@@ -5,6 +5,9 @@ import { mkdir, open, readFile, opendir, rename, unlink, lstat } from 'node:fs/p
 import { constants } from 'node:fs';
 import { isDeepStrictEqual } from 'node:util';
 import { VIDEO_MODELS, normalizeVideo, PROMOTION_UNSUPPORTED } from './plugin.js';
+import {validateOSSConfig} from './oss-storage.mjs';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import { readReference } from './media-input.mjs';
 import { isAbsolute, join } from 'node:path';
 import { atomicJSON } from './state-file.mjs';
@@ -98,7 +101,8 @@ function equal(a, b) {
 export function validateConfig(input) {
   const c = { host: '127.0.0.1', port: 8787, profile: 'default', region: 'cn',
     storage: 'file', migrateLegacy: false, pollMs: 1000, pollIntervalMs: 3000, catalogTTLms: 60000, commandTimeoutMs: 120000, maxQueue: 20, historyCacheSize: 100,
-    maxConcurrent: 2, maxAdmissions: 2, maxInputBytes: 64 * 1024 * 1024, maxMediaBytes: 512 * 1024 * 1024, mediaTTL: 3600, maxQueueWaitSeconds: 1800, leaseSeconds: 300, submitWorkers: 6, pollWorkers: 4, downloadWorkers: 2, uploadWorkers: 4, inputPreparationWorkers: 4, unlimitedCredits: false, canvasTaskLimit: 0, canvasChannel: '', ...input };
+    maxConcurrent: 2, maxAdmissions: 2, maxInputBytes: 64 * 1024 * 1024, maxMediaBytes: 512 * 1024 * 1024, mediaTTL: 3600, maxQueueWaitSeconds: 1800, leaseSeconds: 300, submitWorkers: 6, pollWorkers: 4, downloadWorkers: 2, uploadWorkers: 4, ossWorkers: 2, inputPreparationWorkers: 4, unlimitedCredits: false, canvasTaskLimit: 0, canvasChannel: '', ...input };
+  c.oss = validateOSSConfig(c.oss);
   if (!['file','database'].includes(c.storage) || typeof c.migrateLegacy!=='boolean') fail('invalid storage configuration');
   if (c.storage==='database' && !c.databaseUrl) fail('database storage requires DREAMINA_DATABASE_URL');
   if (![0,5].includes(c.canvasTaskLimit)) fail('invalid config canvasTaskLimit (0 or 5)');
@@ -118,7 +122,7 @@ export function validateConfig(input) {
   c.publicUrl = url.origin;
   for (const [key, min, max] of [['port', 1, 65535], ['pollMs', 1000, 60000], ['commandTimeoutMs', 1000, 600000],
     ['maxQueue', 1, 200], ['maxConcurrent', 1, 200], ['maxAdmissions', 1, 200], ['maxInputBytes', 1, 64 * 1024 * 1024], ['historyCacheSize', 1, 1000], ['maxMediaBytes', 1, 1073741824], ['mediaTTL', 60, 86400],
-    ['maxQueueWaitSeconds', 1, 1800], ['leaseSeconds', 1, 300], ['submitWorkers', 1, 12], ['pollWorkers', 1, 8], ['downloadWorkers', 1, 4], ['uploadWorkers', 1, 4], ['inputPreparationWorkers', 1, 4], ['pollIntervalMs', 1000, 60000], ['catalogTTLms', 1000, 60000]]) {
+    ['maxQueueWaitSeconds', 1, 1800], ['leaseSeconds', 1, 300], ['submitWorkers', 1, 12], ['pollWorkers', 1, 8], ['downloadWorkers', 1, 4], ['uploadWorkers', 1, 4], ['ossWorkers', 1, 4], ['inputPreparationWorkers', 1, 4], ['pollIntervalMs', 1000, 60000], ['catalogTTLms', 1000, 60000]]) {
     if (!integer(c[key], min, max)) fail('invalid config ' + key);
   }
   if (!c.models || Array.isArray(c.models) || !Object.keys(c.models).length) fail('config models are required');
@@ -568,6 +572,7 @@ export class Bridge {
       if (activeUnits + this.preparingUnits + request.n > this.config.maxQueue) fail('Active video queue is full. Please retry after existing tasks finish.', 429, 'active_queue_full');
       const job = { id: randomUUID(), key: keyHash, digest, context: this.contextKey, request, ...(billing?{billing}:{}),
         ...(waitForGateway && /^task_[A-Za-z0-9_-]{1,160}$/.test(key) ? {gatewayTaskId:key} : {}),
+        ...(request.kind === 'video' && this.config.oss ? {outputStorage:{...this.config.oss,type:'oss',status:'pending'}} : {}),
         ...(request.kind === 'video' ? {billingMode: billing ? 'credits' : 'legacy_seconds'} : {}),
         nodeId: 'node_' + Array.from(randomBytes(10), b => '0123456789abcdefghjkmnpqrstvwxyz'[b & 31]).join(''), updateId: randomUUID(), submitId: randomUUID(),
         status: 'queued', created_at: Math.floor(Date.now() / 1000), timings: {admitted_at_ms: Date.now()}, files: [], inputs: [] };
@@ -766,6 +771,7 @@ export class Bridge {
       ...(j.request.kind === 'video' ? {billing_mode: Object.hasOwn(j,'billing') ? 'credits' : j.billingMode ?? 'legacy_seconds'} : {}),
       ...(billing ? {billing} : {}),
       ...mediaDeadlines(j),
+      ...(j.outputStorage?.status === 'ready' ? {storage:'oss',video_url:j.outputStorage.urls[0],video_urls:j.outputStorage.urls.slice(),download_url_expires_at:j.outputStorage.urlExpiresAt} : {}),
       ...(mediaDeadlines(j).content_expires_at?{content_expired:Date.now()>=mediaDeadlines(j).content_expires_at*1000}:{}),
       n: j.request.n, mode:j.request.mode, ratio:j.request.ratio, resolution:j.request.resolution,
       video_count:j.request.kind === 'video' && j.status === 'completed' ? j.files.length : 0,
@@ -773,7 +779,7 @@ export class Bridge {
       ...(j.request.model === 'seedance_2.5_draft' ? {warning:'样片最长存储 7 天，具体期限以即梦服务端为准；' + PROMOTION_UNSUPPORTED} : {}),
       seconds: j.request.seconds, image_count: j.status === 'completed' ? j.files.length : j.request.n,
       timings: j.timings ? {...j.timings} : undefined,
-      phase: terminal(j) ? j.status : j.attention ? 'needs_attention' : j.downloadResources ? 'downloading' : j.status,
+      phase: terminal(j) ? j.status : j.outputStorage?.status === 'uploading' ? 'uploading' : j.attention ? 'needs_attention' : j.downloadResources ? 'downloading' : j.status,
       recovery: this.recovery(j), diagnostics: j.diagnostics ? structuredClone(j.diagnostics) : undefined,
       progress: j.status === 'completed' ? 100 : 0, attention: j.attention, error: j.error,
       data: j.status === 'completed' && j.request.kind === 'image' ? j.files.map((f, i) => ({ url: this.mediaURL(j.id, i) })) : [] };
@@ -792,6 +798,8 @@ export class Bridge {
       if(['20100','20110','20115'].includes(String(job.error?.upstream_code))){action='fix_input_then_resubmit';message='请修改输入内容后重新提交，不自动重试';}
       if(job.error?.code==='queue_expired'){action='resubmit';message='本地排队超时，可重新提交';}
       if(job.error?.code==='download_failed'){action='review_failure';message='原生成资源已保留，请联系管理员恢复下载，请勿重新生成';}
+    } else if (job.outputStorage?.status === 'uploading') {
+      action='retry_upload';message='视频已生成，正在上传存储，请勿重新生成';
     } else if (['context_mismatch','context_unverified'].includes(job.attention)) {
       action = 'manual_review'; message = '请管理员核对原渠道的 CLI 账号和空间，系统将按原任务重查，请勿重新生成';
     } else if(job.downloadResources){action='retry_download';message='正在获取生成结果，请勿重新生成';}
@@ -862,6 +870,7 @@ export class Bridge {
     // Legacy completions predate terminal receipts and checksums. Preserve
     // their original result without issuing new credit delivery evidence.
     if (!hasCreditBilling(job)) return this.get(id,job);
+    if (job.outputStorage?.status === 'ready') return {...this.get(id,job),delivery_verified:true};
     const expires = mediaDeadlines(job).content_expires_at;
     if (expires && Date.now() >= expires * 1000) return {...this.get(id,job),delivery_verified:false};
     // Historical records without a submission identity remain downloadable,
@@ -979,21 +988,22 @@ export class Bridge {
     // asynchronous work. Overlapping timer ticks cannot dispatch a job twice.
     let occupied = [...this.jobs.values()].reduce((n,j) => n +
       (j.status === 'in_progress' || j.status === 'queued' && this.inFlight.has(j.id) ? j.request.n : 0), 0);
-    for (const lane of ['download', 'poll', 'submit']) {
+    for (const lane of ['oss', 'download', 'poll', 'submit']) {
       const workers = [...this.inFlight.values()].filter(w => w.lane === lane);
       let available = this.config[lane + 'Workers'] - workers.length;
       const busyCanvases = new Set(workers.map(w => w.projectId));
       const candidates = [...this.jobs.values()].filter(j => lane === 'submit' ? j.status === 'queued' :
-        j.status === 'in_progress' && (lane === 'download' ? !!j.downloadResources : !j.downloadResources));
-      const cursor = lane === 'poll' ? 'lastPolledId' : lane === 'download' ? 'lastDownloadedId' : 'lastQueuedId';
+        j.status === 'in_progress' && (lane === 'oss' ? j.outputStorage?.status === 'uploading' : j.outputStorage?.status !== 'uploading' && (lane === 'download' ? !!j.downloadResources : !j.downloadResources)));
+      const cursor = lane === 'oss' ? 'lastOSSId' : lane === 'poll' ? 'lastPolledId' : lane === 'download' ? 'lastDownloadedId' : 'lastQueuedId';
       const previous = candidates.findIndex(j => j.id === this[cursor]);
       for (let offset = 1; offset <= candidates.length && available > 0; offset++) {
         const job = candidates[(previous + offset) % candidates.length];
         if (this.inFlight.has(job.id)) continue;
+        if (lane === 'oss' && Date.now() < (job.outputStorage.nextAttemptAt || 0)) continue;
         if (lane === 'poll' && Date.now() < Math.max(this.nextPoll.get(job.id) || 0, job.diagnostics?.next_poll_at_ms || 0)) continue;
         if (lane === 'download' && Date.now() < Math.max(this.nextDownload.get(job.id) || 0, job.diagnostics?.next_download_at_ms || 0)) continue;
         const expired = job.status === 'queued' && Date.now() >= (job.created_at + this.config.maxQueueWaitSeconds) * 1000;
-        if (!expired && Date.now() < (job.diagnostics?.next_context_check_at_ms || 0)) continue;
+        if (lane !== 'oss' && !expired && Date.now() < (job.diagnostics?.next_context_check_at_ms || 0)) continue;
         const projectId = this.projectId(job);
         if (lane === 'submit' && !expired) {
           if (!this.dispatchAllowed(job) || occupied + job.request.n > this.config.maxConcurrent || busyCanvases.has(projectId)) continue;
@@ -1220,6 +1230,7 @@ export class Bridge {
   async processJob(job) {
     this.resumeUnverifiedCompletion(job);
     if (terminal(job)) return;
+    if (job.outputStorage?.status === 'uploading') return this.uploadOutputs(job);
     if (job.billingResolutionExpiresAt && !job.upstreamCreditQuote && Date.now() >= job.billingResolutionExpiresAt * 1000) {
       this.failed(job,'billing_quote_unavailable'); await this.save(job); return;
     }
@@ -1581,7 +1592,8 @@ export class Bridge {
       // Public artifact keys are dense and preserve upstream output order,
       // even if a later resource was verified before a retried earlier one.
       job.files.sort((a,b) => job.downloadResources.indexOf(a.resourceId) - job.downloadResources.indexOf(b.resourceId));
-      job.status = 'completed'; job.completed_at = Math.floor(Date.now() / 1000);
+      if (job.outputStorage) job.outputStorage.status = 'uploading';
+      else { job.status = 'completed'; job.completed_at = Math.floor(Date.now() / 1000); }
       delete job.attention;
       this.recordTime(job, 'download_completed_at_ms');
       job.diagnostics.next_download_at_ms = 0;
@@ -1594,6 +1606,51 @@ export class Bridge {
       if (issue?.stage === 'download') job.diagnostics.last_error = issue;
       job.diagnostics.next_download_at_ms = 0;
     }
+    await this.save(job);
+  }
+
+  async uploadOutputs(job) {
+    if (terminal(job) || !job.files.length || !job.outputStorage) return;
+    const storage=job.outputStorage;
+    storage.status='uploading';
+    this.recordTime(job,'oss_upload_started_at_ms');
+    for (const [index,file] of job.files.entries()) {
+      if (file.oss) continue;
+      let saved;
+      try {
+        if (!this.oss) throw Error('OSS unavailable');
+        const date=new Date(job.created_at*1000).toISOString().slice(0,10).replaceAll('-','/');
+        const taskId=/^task_[A-Za-z0-9_-]{1,160}$/.test(job.gatewayTaskId || '') ? job.gatewayTaskId : job.id;
+        const key=storage.prefix+'/'+date+'/'+taskId+'/outputs/'+String(index+1).padStart(3,'0')+'.mp4';
+        saved=await this.oss.upload(file,join(this.config.dataDir,file.filename),storage,key);
+      } catch {
+        // SDK errors can contain credentials/URLs. Expose only a fixed message.
+        storage.attempts=(storage.attempts || 0)+1;
+        storage.nextAttemptAt=Date.now()+Math.min(60000,5000*2**Math.min(storage.attempts-1,4));
+        job.attention='oss_upload_failed';
+        this.recordIssue(job,'oss',{code:'oss_upload_failed',message:'视频已生成，上传存储暂时失败，正在重试上传，请勿重新生成'});
+        await this.save(job); return;
+      }
+      file.oss=saved;
+      // Keep persistence failures out of the retry catch: fail-stop on DB loss.
+      await this.save(job);
+    }
+    let urls;
+    const issuedAt=Math.floor(Date.now()/1000);
+    try {
+      if (!this.oss) throw Error('OSS unavailable');
+      urls=await Promise.all(job.files.map(file=>this.oss.sign(file.oss,storage.signedUrlSeconds)));
+    } catch {
+      storage.nextAttemptAt=Date.now()+60000;
+      job.attention='oss_upload_failed';
+      this.recordIssue(job,'oss',{code:'oss_sign_failed',message:'视频已保存，下载链接签发暂时失败，正在重试'});
+      await this.save(job); return;
+    }
+    Object.assign(storage,{status:'ready',urls,urlExpiresAt:issuedAt+storage.signedUrlSeconds,nextAttemptAt:0});
+    job.status='completed';job.completed_at=Math.floor(Date.now()/1000);
+    delete job.attention;
+    this.recordTime(job,'oss_upload_completed_at_ms');
+    if(job.diagnostics?.last_error?.stage==='oss')job.diagnostics.last_error.resolved_at_ms=Date.now();
     await this.save(job);
   }
 
@@ -1665,6 +1722,30 @@ function json(res, status, body, privateReceipt = false) {
 async function content(bridge, req, res, id, index) {
   const job = await bridge.loadJob(id), file = job?.files[index];
   if (job?.status !== 'completed' || !file) fail('content not found', 404);
+  if (job.outputStorage?.status === 'ready' && file.oss) {
+    if (!bridge.oss) fail('OSS download is temporarily unavailable',503,'oss_unavailable');
+    const headers={};
+    if(req.headers.range)headers.Range=req.headers.range;
+    const abort=new AbortController();
+    const timer=setTimeout(()=>abort.abort(),120000);
+    const onClose=()=>abort.abort();res.once('close',onClose);
+    try {
+      const url=await bridge.oss.sign(file.oss,300,req.method);
+      const upstream=await fetch(url,{method:req.method,headers,redirect:'error',signal:abort.signal});
+      if (![200,206,416].includes(upstream.status)) {
+        await upstream.body?.cancel();
+        fail('OSS video is temporarily unavailable',upstream.status===404?404:502,'oss_download_failed');
+      }
+      const responseHeaders={'Cache-Control':'private, no-store','X-Content-Type-Options':'nosniff'};
+      for(const key of ['content-type','content-length','content-range','accept-ranges']) {
+        const value=upstream.headers.get(key);if(value)responseHeaders[key]=value;
+      }
+      res.writeHead(upstream.status,responseHeaders);
+      if(req.method==='HEAD' || !upstream.body)res.end();
+      else await pipeline(Readable.fromWeb(upstream.body),res);
+    } finally {clearTimeout(timer);res.off('close',onClose);}
+    return;
+  }
   const expires=mediaDeadlines(job).content_expires_at;
   if(expires&&Date.now()>=expires*1000)fail('视频文件已过期（保留 8 小时），请使用下游已保存的副本',410,'artifact_expired');
   let handle,streaming=false;

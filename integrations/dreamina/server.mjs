@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { Bridge, validateConfig, createServer } from './bridge.mjs';
+import {OSSStorage} from './oss-storage.mjs';
 import { GatewayTaskReader } from './gateway-task-reader.mjs';
 
 let bridge, server, timer, cleanupTimer, stopping = false;
@@ -18,6 +19,7 @@ try {
   if (!process.env.DREAMINA_BRIDGE_CONFIG) throw new Error('Set DREAMINA_BRIDGE_CONFIG to your configuration JSON path');
   const input = JSON.parse(await readFile(resolve(process.env.DREAMINA_BRIDGE_CONFIG), 'utf8'));
   const config = validateConfig({ ...input, token: process.env.DREAMINA_BRIDGE_TOKEN, databaseUrl:process.env.DREAMINA_DATABASE_URL });
+  const oss = config.oss ? OSSStorage.fromEnvironment(config.oss) : null;
   const gatewayDatabaseUrl = process.env.DREAMINA_GATEWAY_DATABASE_URL;
   if (!!gatewayDatabaseUrl !== (config.gatewayChannelId !== undefined)) throw new Error('Set both DREAMINA_GATEWAY_DATABASE_URL and gatewayChannelId to enable gateway confirmation');
   // Preflight never creates a canvas, changes space, authorizes a debit, or
@@ -33,6 +35,7 @@ try {
     console.log('Dreamina context and model configuration verified (no generation performed).');
   } else {
     bridge = await Bridge.open(config);
+    bridge.oss = oss;
     if (gatewayDatabaseUrl) bridge.gatewayTaskReader = await GatewayTaskReader.open({url:gatewayDatabaseUrl,channelId:config.gatewayChannelId});
     bridge.promptLimits = probe.promptLimits;
     bridge.videoCatalog = probe.videoCatalog;

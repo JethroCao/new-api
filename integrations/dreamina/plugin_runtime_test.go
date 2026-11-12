@@ -35,6 +35,17 @@ func TestCreditPluginStockHostLifecycle(t *testing.T) {
 	plugin, err := runtime.CompilePlugin(string(source), runtime.Options{})
 	require.NoError(t, err)
 	assert.Equal(t, "dreamina-cli", plugin.Meta.Key)
+	t.Run("OSS delivery preserves provider URLs in the stock video renderer", func(t *testing.T) {
+		data := map[string]any{"object": "video", "storage": "oss", "video_count": 2,
+			"video_urls":              []any{"https://media.example/1.mp4?signed=test", "https://media.example/2.mp4?signed=test"},
+			"download_url_expires_at": 1794460800, "completed_at": 100000,
+			"billing": map[string]any{"credits": 73}}
+		result, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_video", "render"}, map[string]any{}, map[string]any{"status": "SUCCESS", "data": data})
+		require.NoError(t, err)
+		body, err := common.Marshal(result)
+		require.NoError(t, err)
+		assert.JSONEq(t, `{"storage":"oss","video_url":"https://media.example/1.mp4?signed=test","video_urls":["https://media.example/1.mp4?signed=test","https://media.example/2.mp4?signed=test"],"download_url_expires_at":1794460800,"video_count":2}`, string(body))
+	})
 	t.Run("protocol decoding rejects new promotions before billing", func(t *testing.T) {
 		for _, body := range []map[string]any{
 			{"kind": "json", "value": map[string]any{"mode": "promote", "draft_task_id": "task_draft"}},
