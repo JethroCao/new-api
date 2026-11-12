@@ -17,13 +17,24 @@ const SIZES = {
 const INPUT_FIELDS = ["model", "prompt", "seconds", "duration", "resolution", "size", "ratio", "aspect_ratio", "n", "mode", "input_reference", "references", "images", "videos", "audios", "first_image", "last_image", "generate_audio", "watermark"];
 const STATUS = { queued: "QUEUED", running: "IN_PROGRESS", completed: "SUCCESS", failed: "FAILURE" };
 const MEDIA_FIELDS = { image: "images", video: "videos", audio: "audios" };
+// Public no-input-video rates checked against UStori's account documentation
+// on 2026-11-12. Integer hundredths of a credit per second, estimates only.
+// Do not apply an account discount twice: charged_amount already includes it.
+const CREDIT_RATES = {
+  "Seedance-2.0": { "720p": 385, "1080p": 910, "2160p": 2200 },
+  "Seedance-2.0-Fast": { "720p": 165 },
+  "Seedance-2.0-mini": { "720p": 165 },
+  "Seedance-2.5": { "480p": 330, "720p": 495, "1080p": 1760 },
+  "Wan-3.0": { "480p": 300, "720p": 600, "1080p": 1200 },
+};
+const CREDIT_BILLING = "ustori_credits_v1";
 
 export const meta = {
   apiVersion: 1,
   key: "ustori",
   name: "UStori Video",
   icon: "text:US",
-  version: "1.0.1",
+  version: "1.1.0",
   author: { name: "Nexora" },
   description: { en: "Video generation through the UStori API", zh: "通过 UStori API 生成视频" },
   baseUrl: "https://platform.ustori.com",
@@ -33,7 +44,7 @@ export const meta = {
   fetchMode: "per_task",
   protocols: ["openai_video"],
   usageSchema: {
-    seconds: { type: "number", unit: "second", description: { en: "Video generation unit price", zh: "视频生成单价" } },
+    credits: { type: "number", unit: "credit", description: { en: "UStori credit unit price", zh: "UStori 积分单价" } },
     resolution: { enum: ["480p", "720p", "1080p", "2160p"], description: { en: "Output video resolution", zh: "输出视频分辨率" } },
     video_input: { enum: ["none", "video"], description: { en: "Reference video input", zh: "参考视频输入" } },
   },
@@ -178,7 +189,11 @@ export function parseSubmitResponse(ctx, response) {
   if (typeof body?.id !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(body.id)) throw new Error("UStori returned an invalid task ID");
   // A receipt with an ID can be polled even if UStori adds an initial status.
   const recognized = typeof body.status === "string" && Object.hasOwn(STATUS, body.status);
-  return { taskId: body.id, taskData: recognized ? { status: body.status } : {}, state: { autoDuration: ctx.requestBody.duration === -1 } };
+  return {
+    taskId: body.id,
+    taskData: recognized ? { status: body.status } : {},
+    state: { autoDuration: ctx.requestBody.duration === -1, billingMode: CREDIT_BILLING, model: modelName(ctx.upstreamModel || ctx.model) },
+  };
 }
 
 export function buildQueryRequest(ctx) {
@@ -191,12 +206,52 @@ function automaticOutputSeconds(body) {
   return Number.isSafeInteger(seconds) && seconds >= 1 && seconds <= MODELS["Wan-3.0"].maxSeconds ? seconds : null;
 }
 
+function finalBillingIssue(body) {
+  // Only explicit, recognized billing states can wait without consuming the
+  // host's consecutive-error budget. Invalid values remain UNKNOWN; neither
+  // this wait nor its warning disables the host's overall task timeout.
+  const amount = body.charged_amount;
+  const version = body.billing_rule_version;
+  if (amount != null && (!Number.isSafeInteger(amount) || amount < 0 || amount > 100000000000000)) return { status: "invalid", code: "ustori_billing_amount_invalid", message: "UStori 返回的实际扣款金额格式或范围异常" };
+  if (version != null && version !== "discount_cent_v1") return { status: "invalid", code: "ustori_billing_version_unsupported", message: "UStori 返回的计费版本无法识别，不能确认金额单位" };
+  if (body.billing_status === "reserved") return { status: "pending", code: "ustori_billing_pending", message: "UStori 视频已生成，正在等待上游完成结算" };
+  if (body.billing_status !== "charged") return { status: "invalid", code: "ustori_billing_status_invalid", message: "UStori 已完成任务的扣款状态缺失或异常" };
+  if (amount == null) return { status: "pending", code: "ustori_billing_amount_pending", message: "UStori 已标记扣款，正在等待实际扣款金额" };
+  if (version == null) return { status: "pending", code: "ustori_billing_version_pending", message: "UStori 已标记扣款，正在等待计费版本以确认金额单位" };
+  return null;
+}
+
+function chargedCredits(ctx, body) {
+  // The authenticated task API returns microyuan, not credits: 1 credit is
+  // CNY 0.10 = 100,000 microyuan. Keep fractional credits and explicit zero.
+  // Only this billing version's units have been verified; do not guess when
+  // the provider changes them or substitute reserved_amount/standard_amount.
+  const amount = body?.charged_amount;
+  if (ctx.state?.billingMode !== CREDIT_BILLING || body?.id !== ctx.taskId ||
+      body.model_name !== ctx.state.model || body.status !== "completed" ||
+      finalBillingIssue(body) !== null) {
+    return null;
+  }
+  return amount / 100000;
+}
+
 export function parseTaskResult(ctx, body) {
-  if (!body || body.id !== ctx.taskId || typeof body.status !== "string" || !Object.hasOwn(STATUS, body.status)) return { status: "UNKNOWN" };
+  if (!body || body.id !== ctx.taskId) return { status: "UNKNOWN", reason: "ustori_receipt_mismatch: UStori 回执与原任务不匹配，请管理员核对，勿重复提交" };
+  if (typeof body.status !== "string" || !Object.hasOwn(STATUS, body.status)) return { status: "UNKNOWN", reason: "ustori_task_status_unknown: UStori 任务状态无法识别，请管理员核对，勿重复提交" };
+  const creditBilling = ctx.state?.billingMode === CREDIT_BILLING;
+  if ((ctx.state?.billingMode !== undefined && !creditBilling) ||
+      (creditBilling && body.model_name !== ctx.state.model)) return { status: "UNKNOWN", reason: "ustori_billing_context_mismatch: UStori 回执模型或本地计费版本不匹配，请管理员核对，勿重复提交" };
   const status = STATUS[body.status];
   if (status === "SUCCESS") {
-    if (!videoURLs(body).length) return { status: "UNKNOWN" };
-    if (ctx.state?.autoDuration && automaticOutputSeconds(body) === null) {
+    if (!videoURLs(body).length) return { status: "UNKNOWN", reason: "ustori_video_missing: UStori 已标记完成但缺少有效视频地址，请管理员核对交付与扣款，勿重复提交" };
+    if (creditBilling) {
+      const issue = finalBillingIssue(body);
+      if (issue) {
+        const reason = issue.code + ": " + issue.message + "；请勿重复提交，请管理员在任务超时前核对上游账单";
+        if (issue.status === "pending") return { status: "IN_PROGRESS", progress: "99%", reason };
+        return { status: "UNKNOWN", reason };
+      }
+    } else if (ctx.state?.autoDuration && automaticOutputSeconds(body) === null) {
       // Missing completion facts otherwise cause the host to settle the reservation.
       return { status: "UNKNOWN", reason: "UStori did not return a valid automatic output duration" };
     }
@@ -209,14 +264,31 @@ export function parseTaskResult(ctx, body) {
 }
 
 export function extractUsage(ctx) {
-  if (ctx.usagePurpose === "billing_ratios") return null;
+  if (ctx.usagePurpose === "billing_ratios") throw new Error("Configure a credit billing expression for this UStori model");
   const input = ctx.requestBody;
-  const spec = MODELS[modelName(ctx.upstreamModel || ctx.model)];
-  return { seconds: input.duration === -1 ? spec.maxSeconds : input.duration, resolution: input.resolution, video_input: input.videos?.length ? "video" : "none" };
+  const model = modelName(ctx.upstreamModel || ctx.model);
+  const spec = MODELS[model];
+  const seconds = input.duration === -1 && model === "Wan-3.0" ? spec.maxSeconds : input.duration;
+  const rate = CREDIT_RATES[model][input.resolution];
+  if (!Number.isSafeInteger(seconds) || seconds < spec.minSeconds || seconds > spec.maxSeconds ||
+      !Number.isSafeInteger(rate) || input.videos?.length) throw new Error("Invalid UStori credit estimate");
+  // UStori rounds the whole charge up to 0.1 credit. Rates are integers to
+  // avoid floating-point over-reservation at exact rounding boundaries.
+  // New requests intentionally omit seconds: old seconds expressions then
+  // fail before submission, rather than silently continuing the old tariff.
+  return { credits: Math.ceil(seconds * rate / 10) / 10, resolution: input.resolution, video_input: "none" };
 }
 
 export function extractUsageOnComplete(ctx, result, body) {
-  if (result.status !== "SUCCESS" || !ctx.state?.autoDuration) return null;
+  if (result.status !== "SUCCESS") return null;
+  if (ctx.state?.billingMode === CREDIT_BILLING) {
+    const credits = chargedCredits(ctx, body);
+    if (credits === null) throw new Error("UStori final charged amount is missing or invalid");
+    return { credits };
+  }
+  // Tasks submitted before 1.1.0 keep their frozen seconds expression. Never
+  // reinterpret an old reservation as credits during a rolling upgrade.
+  if (!ctx.state?.autoDuration) return null;
   const seconds = automaticOutputSeconds(body);
   return seconds === null ? null : { seconds };
 }
@@ -245,6 +317,10 @@ export const protocols = {
     },
     render(_ctx, task) {
       if (task.status === "FAILURE") return { error: { code: "video_generation_failed", message: task.fail_reason || "UStori video generation failed" } };
+      if (task.status === "IN_PROGRESS" && task.data?.status === "completed" && videoURLs(task.data).length) {
+        const issue = finalBillingIssue(task.data);
+        if (issue?.status === "pending") return { billing: { ...issue, message: issue.message + "；系统将继续查询原任务，请勿重复提交；如持续未更新，请联系管理员在任务超时前核对" } };
+      }
       if (task.status !== "SUCCESS") return {};
       const urls = videoURLs(task.data);
       return urls.length ? { video_url: urls[0], video_urls: urls } : {};
