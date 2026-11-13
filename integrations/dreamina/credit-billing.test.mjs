@@ -2,12 +2,151 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {buildCreditPlugin} from './build-credit-plugin.mjs';
 import {VIDEO_MODELS} from './plugin.js';
+import {Bridge,validateConfig,createServer} from './bridge.mjs';
+import {mkdtemp,writeFile,rm} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+import {createHash} from 'node:crypto';
 globalThis.utils={base64URLDecode:value=>Buffer.from(value,'base64url').toString('utf8')};
 const config={models:Object.keys(VIDEO_MODELS)};
 const load=async c=>import('data:text/javascript;base64,'+Buffer.from(await buildCreditPlugin(c)).toString('base64'));
 const ctx={publicTaskId:'task_test',model:'seedance_2.5',upstreamModel:'seedance_2.5',operation:'create',apiKey:'bridge-secret',baseUrl:'http://bridge',requestBody:{model:'seedance_2.5',prompt:'waves',seconds:5,n:2,resolution:'480p'}};
 const ack={id:'job-123',object:'video',billing_mode:'credits',status:'queued',model:'seedance_2.5',seconds:5,n:2,mode:'t2v',ratio:'16:9',resolution:'480p',video_count:0,billing:{version:2,request_id:'task_test',reserved_credits:120}};
 const done={...ack,terminal_proof:true,delivery_verified:true,status:'completed',video_count:2,billing:{...ack.billing,credits:73,basis:'accepted_quote'}};
+
+test('Flash estimates surveyed credits without trusting reference duration hints', async () => {
+ const p=await load({models:['seedance_2.5_flash']});
+ const ref=type=>({type,url:'https://example.com/reference'});
+ // Quote-only survey on 2026-11-13. Video reservations use the maximum
+ // combined reference duration (30 rounded seconds), not a per-file bound.
+ for(const [resolution,seconds,n,references,credits] of [
+  ['480p',4,1,[],28],['480p',5,1,[],35],['480p',30,4,[],840],
+  ['720p',4,1,[],76],['720p',5,1,[],95],['720p',30,4,[],2280],
+  ['720p',10,2,[ref('image'),ref('audio')],380],
+  ['480p',5,1,[ref('audio')],35],
+  ['480p',5,1,[ref('image'),ref('image')],35],
+  ['480p',5,1,[ref('video')],245],
+  ['720p',5,4,[ref('video'),ref('video'),ref('audio')],980],
+ ]) {
+  const c={...ctx,model:'flash-alias',upstreamModel:'seedance_2.5_flash',
+   requestBody:{prompt:'waves',resolution,seconds,n,references}};
+  assert.deepEqual(p.extractUsage(c),{credits,resolution});
+  const submit=p.buildSubmitRequest(c);
+  assert.equal(submit.body.model,'seedance_2.5_flash');
+  assert.equal(JSON.parse(submit.headers['X-Dreamina-Billing']).reserved_credits,credits);
+ }
+ const c={...ctx,model:'seedance_2.5_flash',upstreamModel:'seedance_2.5_flash',
+  requestBody:{prompt:'waves',mode:'m2v',resolution:'720p',seconds:30,n:4}};
+ const references=[...Array(10).fill(ref('image')),...Array(5).fill(ref('video')),...Array(5).fill(ref('audio'))];
+ assert.deepEqual(p.extractUsage({...c,requestBody:{...c.requestBody,references}}),{credits:1680,resolution:'720p'});
+ for(const type of ['image','video','audio']) {
+  assert.throws(()=>p.extractUsage({...c,requestBody:{...c.requestBody,references:[...references,ref(type)]}}),/Too many/);
+ }
+ for(const change of [{resolution:'1080p'},{seconds:3},{seconds:31},{n:5},
+  {references:[{...ref('video'),seconds:0}]},{mode:'promote'}]) {
+  assert.throws(()=>p.extractUsage({...c,requestBody:{...c.requestBody,references:[ref('video')],...change}}));
+ }
+});
+
+test('Flash settles accepted credits for delivered results, with refunds and upward adjustments',async()=>{
+ const p=await load({models:['seedance_2.5_flash']});
+ for(const [hasVideo,quoted,count,expected] of [[true,140,2,140],[true,140,1,70],[false,220,2,220],[false,0,2,0]]) {
+  const c={...ctx,model:'seedance_2.5_flash',upstreamModel:'seedance_2.5_flash',
+   requestBody:{...ctx.requestBody,model:'seedance_2.5_flash',resolution:'720p',
+    references:hasVideo?[{type:'video',url:'https://example.com/video.mp4'}]:[]}};
+  const reserved=hasVideo?490:190;
+  assert.equal(p.extractUsage(c).credits,reserved);
+  const receipt={...ack,model:'seedance_2.5_flash',resolution:'720p',mode:hasVideo?'m2v':'t2v',
+   billing:{...ack.billing,reserved_credits:reserved}};
+  const poll={taskId:receipt.id,publicTaskId:c.publicTaskId,state:p.parseSubmitResponse(c,{body:receipt}).state};
+  const body={...receipt,status:'completed',terminal_proof:true,delivery_verified:true,video_count:count,
+   billing:{...receipt.billing,basis:'accepted_quote',credits:quoted}};
+  const result=p.parseTaskResult(poll,body,{status:200});
+  assert.equal(result.status,'SUCCESS');
+  assert.deepEqual(p.extractUsageOnComplete(poll,result,body),{credits:expected,resolution:'720p'});
+  assert.equal(p.listArtifacts({status:result.status,data:body}).length,count);
+  const waiting=p.parseTaskResult(poll,{...body,terminal_proof:false},{status:200});
+  assert.equal(waiting.status,'UNKNOWN');
+  const failed={...body,status:'failed',video_count:0,error:{message:'20100:本次输入文本敏感，安审拦截'}};
+  const failure=p.parseTaskResult(poll,failed,{status:200});
+  assert.equal(failure.status,'FAILURE');assert.equal(failure.reason,failed.error.message);
+  assert.deepEqual(p.extractUsageOnComplete(poll,failure,failed),{});
+ }
+});
+
+test('Flash traverses local HTTP admission, CLI quotation, partial delivery and download',async t=>{
+ const model='seedance_2.5_flash',p=await load({models:[model]});
+ const dir=await mkdtemp(join(tmpdir(),'flash-billing-'));
+ t.after(()=>rm(dir,{recursive:true,force:true}));
+ const token='flash-local-test-token-not-a-real-key';
+ const cfg=validateConfig({cli:process.execPath,dataDir:dir,token,userId:'123',space:'personal',
+  projectId:'11111111-1111-4111-8111-111111111111',publicUrl:'http://127.0.0.1:8787',
+  models:{[model]:{kind:'video',model,maxCredits:0}},unlimitedCredits:true});
+ cfg.pollIntervalMs=0;
+ const bytes=Buffer.from('000000186674797069736f6d0000020069736f6d','hex');
+ const flag=(args,key)=>args.find(a=>a.startsWith('--'+key+'='))?.slice(key.length+3);
+ let saved,finished=false,runs=0;
+ // Only the external CLI is simulated. All admission, receipt, persistence,
+ // polling, delivery and HTTP download behavior below uses the real bridge.
+ const bridge=await Bridge.open(cfg,async args=>{
+  if(args[0]==='space')return {userId:'123',kind:'personal'};
+  if(args[0]==='model')return {items:[{model,modes:[{name:'t2v',flags:[
+   {flag:'--ratio',values:['16:9']},{flag:'--resolution',values:['480p','720p']},
+   {flag:'--duration',min:4,max:30,step:1},{flag:'--count',min:1,max:4,step:1},
+   {flag:'--prompt',minLength:1,maxLength:15000}]}]}]};
+  if(args[0]==='node'&&args[1]==='create'){
+   assert.equal(flag(args,'model'),model);assert.equal(flag(args,'count'),'2');
+   assert.equal(flag(args,'resolution'),'720p');assert.equal(flag(args,'duration'),'5');
+   assert.ok(!args.includes('--run'));
+   saved={nodeId:flag(args,'node-id'),generation:{model,mode:'t2v',ratio:'16:9',
+    resolution:'720p',durationSeconds:5,outputCount:2,prompt:'waves',references:[]}};
+   return {node:saved,mutation:{savedDraftVersion:1}};
+  }
+  if(args[0]==='node'&&args[1]==='show')return {nodes:[saved],draftVersion:1};
+  if(args[0]==='node'&&args[1]==='quote')return {consumptionSubject:{kind:'personal',userId:'123'},
+   items:[{nodeId:saved.nodeId,maxCredits:190}],totalMaxCredits:190,draftVersion:1,confirmable:true,confirmationRequired:true};
+  if(args[0]==='node'&&args[1]==='confirm')return {consumptionSubject:{kind:'personal',userId:'123'},
+   creditConfirmationToken:'local-fixture',creditCeiling:190,expiresAt:'2099-01-01T00:00:00Z'};
+  if(args[0]==='node'&&args[1]==='run'){
+   runs++;return {items:[{nodeId:saved.nodeId,submitId:flag(args,'submit-id'),state:'accepted',resources:[]}]};
+  }
+  if(args[0]==='operation')return {operationRef:args[2],state:finished?'succeeded':'running',resources:finished?
+   [{resourceId:'flash-output',state:'succeeded'},{state:'failed'}]:[]};
+  if(args[0]==='resource'&&args[1]==='download'){
+   const path=flag(args,'output');await writeFile(path,bytes);
+   return {resourceId:args[2],path,size:bytes.length,sha256:createHash('sha256').update(bytes).digest('hex')};
+  }
+  throw Error('Unexpected simulated CLI command: '+args.slice(0,2).join(' '));
+ });
+ t.after(()=>bridge.close());await bridge.preflight();
+ const server=createServer(bridge);
+ await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+ t.after(()=>new Promise(resolve=>{server.closeAllConnections();server.close(resolve);}));
+ cfg.publicUrl='http://127.0.0.1:'+server.address().port;
+ const c={...ctx,model,upstreamModel:model,baseUrl:cfg.publicUrl,apiKey:token,
+  requestBody:{model,prompt:'waves',seconds:5,n:2,resolution:'720p'}};
+ assert.deepEqual(p.extractUsage(c),{credits:190,resolution:'720p'});
+ const submit=p.buildSubmitRequest(c);
+ const response=await fetch(submit.url,{method:submit.method,headers:submit.headers,body:JSON.stringify(submit.body)});
+ assert.equal(response.status,202);
+ const admitted=p.parseSubmitResponse(c,{body:await response.json(),headers:Object.fromEntries(response.headers)});
+ const poll={...c,taskId:admitted.taskId,state:admitted.state};
+ // The gateway has durably recorded this task; observation releases dispatch.
+ await bridge.observe(admitted.taskId);await bridge.tick();
+ assert.equal(runs,1);assert.equal(bridge.get(admitted.taskId).billing.credits,190);
+ finished=true;await bridge.tick();await bridge.tick();
+ const query=p.buildQueryRequest(poll),reply=await fetch(query.url,{headers:query.headers});
+ assert.equal(reply.status,200);
+ const body=await reply.json();
+ const parsed=p.parseTaskResult(poll,body,{status:reply.status,headers:Object.fromEntries(reply.headers)});
+ assert.equal(parsed.status,'SUCCESS');
+ assert.deepEqual(p.extractUsageOnComplete(poll,parsed,body),{credits:95,resolution:'720p'});
+ assert.equal(p.listArtifacts({status:parsed.status,data:body}).length,1);
+ const content=p.buildContentRequest({...c,upstreamTaskId:admitted.taskId,data:body,artifactKey:'video',clientRequest:{method:'GET'}});
+ const download=await fetch(content.url,{headers:content.headers});
+ assert.equal(download.status,200);assert.deepEqual(Buffer.from(await download.arrayBuffer()),bytes);
+ assert.equal(runs,1);
+});
 
 test('credit artifact has stock metadata and derives reservation from validated batch count',async()=>{
  const p=await load(config);assert.equal(p.meta.key,'dreamina-cli');assert.equal(p.meta.requiredCapabilities,undefined);

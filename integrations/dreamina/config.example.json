@@ -18,6 +18,11 @@
       "model": "seedance_2.5",
       "maxCredits": 0
     },
+    "seedance_2.5_flash": {
+      "kind": "video",
+      "model": "seedance_2.5_flash",
+      "maxCredits": 0
+    },
     "seedance_2.5_draft": {
       "kind": "video",
       "model": "seedance_2.5_draft",

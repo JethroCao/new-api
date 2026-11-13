@@ -19,13 +19,17 @@ const snapshot = () => ({entries: models.map((model_name, i) => ({
 
 test('review artifact records historical CNY baseline and distinct model-resolution credit prices', async () => {
   assert.deepEqual(JSON.parse(await readFile(new URL('./standard-credit-pricing.json', import.meta.url))), catalog);
-  assert.equal(Object.keys(catalog.prices).length, 8);
+  assert.equal(Object.keys(catalog.prices).length, 9);
   assert.equal(catalog.currency, 'CNY');
   assert.equal(catalog.quota_per_currency_unit, 500000);
   assert.equal(catalog.group_ratio, 1);
   assert.match(catalog.scope, /Kemeng pricing is excluded/);
   assert.match(catalog.scope, /host group ratio for other groups/);
   assert.match(catalog.provenance.baseline, /not newly verified/);
+  const flash = catalog.prices['seedance_2.5_flash'];
+  assert.equal(flash['480p'].cny_per_credit, 0.044);
+  assert.ok(Math.abs(95 * flash['720p'].cny_per_credit - 3.465) < 1e-12);
+  assert.equal(catalog.provenance.model_overrides.seedance_2_5_flash.verified_date, '2026-11-13');
   const prices = catalog.prices['seedance_2.5'];
   assert.ok(Math.abs(120 * prices['480p'].cny_per_credit - 4.690) < 1e-12);
   assert.ok(Math.abs(120 * prices['720p'].cny_per_credit - 6.342) < 1e-12);
@@ -40,7 +44,7 @@ test('versioned drafts retain administrator fields and other providers without m
   const original = snapshot();
   const before = structuredClone(original);
   const result = prepareStandardCreditPricing({success: true, data: original});
-  assert.equal(result.changes.length, 9);
+  assert.equal(result.changes.length, 10);
   assert.deepEqual(result.replacements, []);
   for (const change of result.changes) {
     const entry = original.entries.find(entry => entry.model_name === change.model_name);

@@ -7,6 +7,7 @@ export const VIDEO_MODELS = {
   'seedance_2.0_mini': { resolutions: ['720p'], minSeconds: 4, maxSeconds: 15, promptLimit: 4000, ratios: SEEDANCE_RATIOS, frames: 2, references: { total: 12, image: 9, video: 3, audio: 3 }, requireVisual: true },
   'seedance_2.0_vip': { resolutions: ['720p', '1080p', '4k'], minSeconds: 4, maxSeconds: 15, promptLimit: 4000, ratios: SEEDANCE_RATIOS, frames: 2, references: { total: 12, image: 9, video: 3, audio: 3 }, requireVisual: true },
   'seedance_2.5': { resolutions: ['480p', '720p', '1080p'], minSeconds: 4, maxSeconds: 30, promptLimit: 15000, ratios: SEEDANCE_RATIOS, frames: 2, references: { total: 50, image: 30, video: 10, audio: 10 }, requireVisual: false },
+  'seedance_2.5_flash': { resolutions: ['480p', '720p'], minSeconds: 4, maxSeconds: 30, promptLimit: 15000, ratios: SEEDANCE_RATIOS, frames: 2, references: { total: 50, image: 10, video: 5, audio: 5 }, requireVisual: false },
   'seedance_2.5_draft': { resolutions: ['480p'], minSeconds: 4, maxSeconds: 30, promptLimit: 15000, ratios: SEEDANCE_RATIOS, frames: 2, references: { total: 50, image: 30, video: 10, audio: 10 }, requireVisual: false, draft: true },
   'seedance_pro_fast': { resolutions: ['720p', '1080p'], minSeconds: 5, maxSeconds: 10, promptLimit: 2000, ratios: SEEDANCE_RATIOS, frames: 1 },
   'wan_3.0': { resolutions: ['720P', '1080P'], minSeconds: 4, maxSeconds: 15, promptLimit: 20000, ratios: ['16:9', '4:3', '1:1', '3:4', '9:16'], frames: 2, references: { total: 20, image: 10, video: 5, audio: 5 }, requireVisual: true },

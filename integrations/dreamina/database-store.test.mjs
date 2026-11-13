@@ -165,3 +165,39 @@ test('gateway SQLite lock contention fails closed and reconnects after release',
  finally {host.exec('ROLLBACK');}
  assert.equal((await reader.inspect([candidate])).get(candidate.id),'active');
 });
+
+
+test('adding a model preserves historical tasks, idempotency and canvas ownership across restarts',async t=>{
+ const {Bridge,validateConfig}=await import('./bridge.mjs');
+ const dir=await mkdtemp(join(tmpdir(),'dreamina-model-upgrade-'));t.after(()=>rm(dir,{recursive:true,force:true}));
+ const cfg=validateConfig({token:'test-only-bridge-token-32-characters-long',dataDir:dir,cli:process.execPath,
+  profile:'upgrade-'+randomUUID(),region:'cn',userId:'123',space:'personal',projectId,publicUrl:'http://127.0.0.1:8787',
+  storage:'database',databaseUrl:process.env.DREAMINA_TEST_DATABASE_URL||'sqlite://'+join(dir,'jobs.sqlite'),maxQueue:10,
+  models:{'seedance_2.5':{kind:'video',model:'seedance_2.5',maxCredits:60}}});
+ const catalogue={items:['seedance_2.5','seedance_2.5_flash'].map(model=>({model,modes:[{name:'t2v',flags:[{flag:'--ratio',values:['16:9']},{flag:'--resolution',values:['480p']},{flag:'--duration',min:4,max:30,step:1},{flag:'--count',min:1,max:4,step:1},{flag:'--prompt',maxLength:15000}]}]}))};
+ const cli=async args=>{if(args[0]==='space')return {userId:'123',kind:'personal'};if(args[0]==='model')return catalogue;throw Error('No generation allowed');};
+ const original=await Bridge.open(cfg,cli);t.after(()=>original.close());await original.preflight();
+ const request={kind:'video',model:'seedance_2.5',prompt:'waves',seconds:5,resolution:'480p',n:1};
+ const queued=await original.submit(request,'old-queued');
+ const done=await original.submit(request,'old-completed');
+ const completed=original.jobs.get(done.id);completed.status='completed';await original.save(completed);
+ const registry=await original.store.readCanvas();await original.close();
+ const extraModels={'seedance_2.5_flash':{kind:'video',model:'seedance_2.5_flash',maxCredits:60}};
+ for(const extensions of [null,[],{'seedance_2.5':{kind:'video',model:'seedance_2.5',maxCredits:1}},{unknown:{kind:'video',model:'unknown',maxCredits:1}}])
+  assert.throws(()=>validateConfig({...cfg,additionalModels:extensions}),/additional|model/);
+ const expanded=validateConfig({...cfg,additionalModels:extraModels});
+ for(let pass=0;pass<2;pass++){
+  const restored=await Bridge.open(expanded,cli);t.after(()=>restored.close());await restored.preflight();
+  assert.equal((await restored.submit(request,'old-queued')).id,queued.id);
+  assert.equal((await restored.loadJob(done.id)).status,'completed');
+  const recovered=await restored.store.readCanvas();
+  assert.equal(recovered.context,registry.context);
+  assert.equal(recovered.canvases[0].projectId,projectId);
+  assert.ok(recovered.canvases[0].slots.some(slot=>slot.key===hash('old-queued')));
+  const flash=await restored.submit({...request,model:'seedance_2.5_flash'},'flash-new');
+  assert.equal((await restored.loadJob(flash.id)).request.model,'seedance_2.5_flash');
+  assert.equal(await restored.store.count(),3);
+  await restored.close();
+ }
+ await assert.rejects(Bridge.open({...expanded,userId:'456'},cli),/owned by database storage/);
+});

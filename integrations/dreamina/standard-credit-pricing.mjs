@@ -13,6 +13,8 @@ const OPTION = 'billing_setting.plugin_billing_expr';
 // preserve the former output-seconds-only charge. No procurement cost is used.
 const BASELINE = {
   'seedance_2.5': {'480p': [0.469, 12], '720p': [1.057, 20], '1080p': [2.618, 64]},
+  // 2026-11-13 official rounded no-video-input per-second examples at 70%.
+  'seedance_2.5_flash': {'480p': [0.308, 7], '720p': [0.693, 19]},
   'seedance_2.5_draft': {'480p': [0.469, 9]},
   'seedance_2.0_vip': {'720p': [0.693, 14], '1080p': [1.736, 33], '4k': [3.535, 80]},
   'seedance_2.0_fast_vip': {'720p': [0.56, 6]},
@@ -54,7 +56,7 @@ export function buildStandardCreditPricing() {
   expressions[`${PLUGIN_KEY}::dreamina-video`] = expressions[`${PLUGIN_KEY}::seedance_2.5`];
   return {
     schema_version: 1,
-    policy_version: 'standard-credit-70-2026-11-07',
+    policy_version: 'standard-credit-70-2026-11-13',
     scope: 'Normal/default group baseline; plugin model overrides also use the host group ratio for other groups. Kemeng pricing is excluded and this artifact must not enable a Kemeng cost group',
     currency: 'CNY',
     quota_per_currency_unit: 500000,
@@ -65,6 +67,14 @@ export function buildStandardCreditPricing() {
       baseline: 'Archived no-video-input output-second benchmark at 70%; not newly verified official prices',
       credits_date: '2026-11-05',
       credits_source: 'Canvas CLI 1.2.0 quote-only survey; not ledger deductions',
+      model_overrides: {
+        seedance_2_5_flash: {
+          verified_date: '2026-11-13',
+          baseline: 'Official rounded CNY/output-second examples without reference video: 480p 0.44, 720p 0.99; multiplied by 0.7',
+          credits_source: 'Canvas CLI quote-only survey on 2026-11-13; 184 cases; not ledger deductions',
+          reference_policy: 'Same resolution-specific price per accepted credit; not a promise of exactly 70% of every official reference-video example',
+        },
+      },
       sources: [
         'https://docs.volcengine.com/docs/ark/model-pricing?lang=zh',
         'https://docs.volcengine.com/docs/ark/create-video-generation-task-api?lang=zh',

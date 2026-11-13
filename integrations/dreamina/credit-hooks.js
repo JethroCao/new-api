@@ -1,5 +1,5 @@
 // Appended to the shared, self-contained protocol by build-credit-plugin.mjs.
-meta.version='1.4.0';
+meta.version='1.5.0';
 meta.models=CREDIT_MODELS.concat(CREDIT_MODELS.includes('seedance_2.5')?['dreamina-video']:[]);
 meta.usageSchema={
  credits:{type:'number',unit:'credit',description:{en:'Dreamina credit unit price',zh:'即梦积分单价'}},
@@ -7,10 +7,12 @@ meta.usageSchema={
 };
 
 // Measured with Canvas CLI 1.2.0 on 2026-11-05 (2,289 quote-only cases).
+// Flash added from the 2026-11-13 survey (184 quote-only cases, CLI 1.2.0).
 // Values are credits, not monetary prices or confirmed ledger deductions.
 // Each tier is [no reference video, with reference video].
 const CREDIT_RATES = {
  'seedance_2.5': {'480p':[12,9], '720p':[20,13], '1080p':[64,64]},
+ 'seedance_2.5_flash': {'480p':[7,7], '720p':[19,7]},
  'seedance_2.5_draft': {'480p':[9,9]},
  'seedance_2.0_vip': {'720p':[14,14], '1080p':[33,33], '4k':[80,80]},
  'seedance_2.0_fast_vip': {'720p':[6,6]},
@@ -21,7 +23,7 @@ const CREDIT_RATES = {
 };
 // The official limit applies to the sum, not each reference separately.
 const REFERENCE_VIDEO_SECONDS = {
- 'seedance_2.5':30.2, 'seedance_2.5_draft':30.2,
+ 'seedance_2.5':30.2, 'seedance_2.5_draft':30.2, 'seedance_2.5_flash':30.2,
  'seedance_2.0_vip':15.4, 'seedance_2.0_fast_vip':15.4,
  'seedance_2.0_mini':15.4, 'wan_3.0':15,
 };

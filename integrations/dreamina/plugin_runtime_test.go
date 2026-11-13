@@ -355,7 +355,7 @@ func standardCreditExpressions(t *testing.T) map[string]string {
 		Expressions map[string]string `json:"billing_setting.plugin_billing_expr"`
 	}
 	require.NoError(t, common.Unmarshal(data, &artifact))
-	require.Len(t, artifact.Expressions, 9)
+	require.Len(t, artifact.Expressions, 10)
 	return artifact.Expressions
 }
 
@@ -381,6 +381,8 @@ func TestStandardCreditPricingAllTiers(t *testing.T) {
 		{"seedance_2.5", "480p", 120, 2345000},
 		{"seedance_2.5", "720p", 200, 5285000},
 		{"seedance_2.5", "1080p", 640, 13090000},
+		{"seedance_2.5_flash", "480p", 70, 1540000},
+		{"seedance_2.5_flash", "720p", 190, 3465000},
 		{"seedance_2.5_draft", "480p", 90, 2345000},
 		{"seedance_2.0_vip", "720p", 140, 3465000},
 		{"seedance_2.0_vip", "1080p", 330, 8680000},

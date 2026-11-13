@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "policy_version": "standard-credit-70-2026-11-07",
+  "policy_version": "standard-credit-70-2026-11-13",
   "scope": "Normal/default group baseline; plugin model overrides also use the host group ratio for other groups. Kemeng pricing is excluded and this artifact must not enable a Kemeng cost group",
   "currency": "CNY",
   "quota_per_currency_unit": 500000,
@@ -11,6 +11,14 @@
     "baseline": "Archived no-video-input output-second benchmark at 70%; not newly verified official prices",
     "credits_date": "2026-11-05",
     "credits_source": "Canvas CLI 1.2.0 quote-only survey; not ledger deductions",
+    "model_overrides": {
+      "seedance_2_5_flash": {
+        "verified_date": "2026-11-13",
+        "baseline": "Official rounded CNY/output-second examples without reference video: 480p 0.44, 720p 0.99; multiplied by 0.7",
+        "credits_source": "Canvas CLI quote-only survey on 2026-11-13; 184 cases; not ledger deductions",
+        "reference_policy": "Same resolution-specific price per accepted credit; not a promise of exactly 70% of every official reference-video example"
+      }
+    },
     "sources": [
       "https://docs.volcengine.com/docs/ark/model-pricing?lang=zh",
       "https://docs.volcengine.com/docs/ark/create-video-generation-task-api?lang=zh",
@@ -35,6 +43,18 @@
         "baseline_cny_per_output_second": 2.618,
         "no_reference_credits_per_output_second": 64,
         "cny_per_credit": 0.04090625
+      }
+    },
+    "seedance_2.5_flash": {
+      "480p": {
+        "baseline_cny_per_output_second": 0.308,
+        "no_reference_credits_per_output_second": 7,
+        "cny_per_credit": 0.044
+      },
+      "720p": {
+        "baseline_cny_per_output_second": 0.693,
+        "no_reference_credits_per_output_second": 19,
+        "cny_per_credit": 0.03647368421052631
       }
     },
     "seedance_2.5_draft": {
@@ -117,6 +137,7 @@
   },
   "billing_setting.plugin_billing_expr": {
     "dreamina-cli::seedance_2.5": "v1:u(\"resolution\") == \"480p\" ? tier(\"480p\", u(\"credits\") * 0.03908333333333333) : u(\"resolution\") == \"720p\" ? tier(\"720p\", u(\"credits\") * 0.052849999999999994) : tier(\"1080p\", u(\"credits\") * 0.04090625)",
+    "dreamina-cli::seedance_2.5_flash": "v1:u(\"resolution\") == \"480p\" ? tier(\"480p\", u(\"credits\") * 0.044) : tier(\"720p\", u(\"credits\") * 0.03647368421052631)",
     "dreamina-cli::seedance_2.5_draft": "v1:tier(\"480p\", u(\"credits\") * 0.05211111111111111)",
     "dreamina-cli::seedance_2.0_vip": "v1:u(\"resolution\") == \"720p\" ? tier(\"720p\", u(\"credits\") * 0.049499999999999995) : u(\"resolution\") == \"1080p\" ? tier(\"1080p\", u(\"credits\") * 0.05260606060606061) : tier(\"4k\", u(\"credits\") * 0.044187500000000005)",
     "dreamina-cli::seedance_2.0_fast_vip": "v1:tier(\"720p\", u(\"credits\") * 0.09333333333333334)",

@@ -7,6 +7,7 @@ export const VIDEO_MODELS = {
   'seedance_2.0_mini': { resolutions: ['720p'], minSeconds: 4, maxSeconds: 15, promptLimit: 4000, ratios: SEEDANCE_RATIOS, frames: 2, references: { total: 12, image: 9, video: 3, audio: 3 }, requireVisual: true },
   'seedance_2.0_vip': { resolutions: ['720p', '1080p', '4k'], minSeconds: 4, maxSeconds: 15, promptLimit: 4000, ratios: SEEDANCE_RATIOS, frames: 2, references: { total: 12, image: 9, video: 3, audio: 3 }, requireVisual: true },
   'seedance_2.5': { resolutions: ['480p', '720p', '1080p'], minSeconds: 4, maxSeconds: 30, promptLimit: 15000, ratios: SEEDANCE_RATIOS, frames: 2, references: { total: 50, image: 30, video: 10, audio: 10 }, requireVisual: false },
+  'seedance_2.5_flash': { resolutions: ['480p', '720p'], minSeconds: 4, maxSeconds: 30, promptLimit: 15000, ratios: SEEDANCE_RATIOS, frames: 2, references: { total: 50, image: 10, video: 5, audio: 5 }, requireVisual: false },
   'seedance_2.5_draft': { resolutions: ['480p'], minSeconds: 4, maxSeconds: 30, promptLimit: 15000, ratios: SEEDANCE_RATIOS, frames: 2, references: { total: 50, image: 30, video: 10, audio: 10 }, requireVisual: false, draft: true },
   'seedance_pro_fast': { resolutions: ['720p', '1080p'], minSeconds: 5, maxSeconds: 10, promptLimit: 2000, ratios: SEEDANCE_RATIOS, frames: 1 },
   'wan_3.0': { resolutions: ['720P', '1080P'], minSeconds: 4, maxSeconds: 15, promptLimit: 20000, ratios: ['16:9', '4:3', '1:1', '3:4', '9:16'], frames: 2, references: { total: 20, image: 10, video: 5, audio: 5 }, requireVisual: true },
@@ -258,9 +259,9 @@ export const protocols={openai_video:{decodeRequest:decode,render:function(ctx,t
 }}};
 
 // Generated credit variant; rebuild with build-credit-plugin.mjs.
-const CREDIT_MODELS=["seedance_2.5","seedance_2.5_draft","seedance_2.0_vip","seedance_2.0_fast_vip","seedance_2.0_mini","seedance_pro_fast","happyhorse_1.1","wan_3.0"];
+const CREDIT_MODELS=["seedance_2.5","seedance_2.5_flash","seedance_2.5_draft","seedance_2.0_vip","seedance_2.0_fast_vip","seedance_2.0_mini","seedance_pro_fast","happyhorse_1.1","wan_3.0"];
 // Appended to the shared, self-contained protocol by build-credit-plugin.mjs.
-meta.version='1.4.0';
+meta.version='1.5.0';
 meta.models=CREDIT_MODELS.concat(CREDIT_MODELS.includes('seedance_2.5')?['dreamina-video']:[]);
 meta.usageSchema={
  credits:{type:'number',unit:'credit',description:{en:'Dreamina credit unit price',zh:'即梦积分单价'}},
@@ -268,10 +269,12 @@ meta.usageSchema={
 };
 
 // Measured with Canvas CLI 1.2.0 on 2026-11-05 (2,289 quote-only cases).
+// Flash added from the 2026-11-13 survey (184 quote-only cases, CLI 1.2.0).
 // Values are credits, not monetary prices or confirmed ledger deductions.
 // Each tier is [no reference video, with reference video].
 const CREDIT_RATES = {
  'seedance_2.5': {'480p':[12,9], '720p':[20,13], '1080p':[64,64]},
+ 'seedance_2.5_flash': {'480p':[7,7], '720p':[19,7]},
  'seedance_2.5_draft': {'480p':[9,9]},
  'seedance_2.0_vip': {'720p':[14,14], '1080p':[33,33], '4k':[80,80]},
  'seedance_2.0_fast_vip': {'720p':[6,6]},
@@ -282,7 +285,7 @@ const CREDIT_RATES = {
 };
 // The official limit applies to the sum, not each reference separately.
 const REFERENCE_VIDEO_SECONDS = {
- 'seedance_2.5':30.2, 'seedance_2.5_draft':30.2,
+ 'seedance_2.5':30.2, 'seedance_2.5_draft':30.2, 'seedance_2.5_flash':30.2,
  'seedance_2.0_vip':15.4, 'seedance_2.0_fast_vip':15.4,
  'seedance_2.0_mini':15.4, 'wan_3.0':15,
 };

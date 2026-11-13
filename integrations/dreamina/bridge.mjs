@@ -126,7 +126,12 @@ export function validateConfig(input) {
     if (!integer(c[key], min, max)) fail('invalid config ' + key);
   }
   if (!c.models || Array.isArray(c.models) || !Object.keys(c.models).length) fail('config models are required');
-  for (const [alias, m] of Object.entries(c.models)) {
+  if (c.additionalModels !== undefined && (!c.additionalModels || typeof c.additionalModels !== 'object' ||
+      Array.isArray(c.additionalModels) || Object.keys(c.additionalModels).some(alias => Object.hasOwn(c.models, alias) || !Object.hasOwn(VIDEO_MODELS, alias)))) {
+    fail('invalid additional models: only new named video models may be appended');
+  }
+  for (const [alias, m] of Object.entries({...c.models, ...c.additionalModels})) {
+    if (!m || typeof m !== 'object' || Array.isArray(m)) fail('invalid config model: ' + alias);
     if (Object.hasOwn(VIDEO_MODELS, alias)) {
       if (m.kind !== 'video' || m.model !== alias || !integer(m.maxCredits, 0, 100000)) fail('invalid config model: ' + alias);
       continue;
@@ -326,7 +331,10 @@ export class Bridge {
   }
 
   constructor(config, cli) {
-    this.config = config;
+    // Keep the original model set in the legacy storage identity. Explicit
+    // additions enable new models without orphaning historical jobs/canvases.
+    // Account, team, profile and original model mappings remain identity-bound.
+    this.config = config.additionalModels ? {...config, models: {...config.models, ...config.additionalModels}} : config;
     const invokeCLI = cli || (args => runCLI(config.cli, ['--format=json', '--non-interactive', '--profile=' + config.profile, '--region=' + config.region, ...args], config.commandTimeoutMs));
     this.cli = args => {this.store?.assertHealthy();return invokeCLI(args);};
     this.contextKey = hash(JSON.stringify([config.profile, config.region, config.userId, config.space, config.projectId, config.models]));
