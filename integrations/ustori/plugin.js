@@ -19,7 +19,7 @@ const STATUS = { queued: "QUEUED", running: "IN_PROGRESS", completed: "SUCCESS",
 const MEDIA_FIELDS = { image: "images", video: "videos", audio: "audios" };
 // Public no-input-video rates checked against UStori's account documentation
 // on 2026-11-12. Integer hundredths of a credit per second, estimates only.
-// Do not apply an account discount twice: charged_amount already includes it.
+// Final charged credits already include the account discount; never apply it twice.
 const CREDIT_RATES = {
   "Seedance-2.0": { "720p": 385, "1080p": 910, "2160p": 2200 },
   "Seedance-2.0-Fast": { "720p": 165 },
@@ -34,7 +34,7 @@ export const meta = {
   key: "ustori",
   name: "UStori Video",
   icon: "text:US",
-  version: "1.1.0",
+  version: "1.1.1",
   author: { name: "Nexora" },
   description: { en: "Video generation through the UStori API", zh: "通过 UStori API 生成视频" },
   baseUrl: "https://platform.ustori.com",
@@ -206,33 +206,54 @@ function automaticOutputSeconds(body) {
   return Number.isSafeInteger(seconds) && seconds >= 1 && seconds <= MODELS["Wan-3.0"].maxSeconds ? seconds : null;
 }
 
+function parseCreditString(value) {
+  // The public API reports exact decimal strings (2026-11-17). The host
+  // requires numeric usage facts: refuse values that would lose decimal
+  // digits in that conversion instead of silently rounding an invoice.
+  if (typeof value !== "string" || value.length > 64 || !/^(0|[1-9]\d*)(\.\d+)?$/.test(value)) return null;
+  const credits = Number(value);
+  if (!Number.isFinite(credits) || credits > 1000000000) return null;
+  const normalized = value.includes(".") ? value.replace(/0+$/, "").replace(/\.$/, "") : value;
+  let roundTrip = String(credits);
+  if (roundTrip.includes("e-")) {
+    const [mantissa, exponent] = roundTrip.split("e-");
+    roundTrip = "0." + "0".repeat(Number(exponent) - 1) + mantissa.replace(".", "");
+  }
+  return roundTrip === normalized ? credits : null;
+}
+
 function finalBillingIssue(body) {
   // Only explicit, recognized billing states can wait without consuming the
   // host's consecutive-error budget. Invalid values remain UNKNOWN; neither
   // this wait nor its warning disables the host's overall task timeout.
   const amount = body.charged_amount;
   const version = body.billing_rule_version;
+  const credits = body.charged_credits == null ? null : parseCreditString(body.charged_credits);
+  if (body.charged_credits != null && credits === null) return { status: "invalid", code: "ustori_billing_credits_invalid", message: "UStori 返回的实际扣费积分格式、精度或范围异常" };
   if (amount != null && (!Number.isSafeInteger(amount) || amount < 0 || amount > 100000000000000)) return { status: "invalid", code: "ustori_billing_amount_invalid", message: "UStori 返回的实际扣款金额格式或范围异常" };
   if (version != null && version !== "discount_cent_v1") return { status: "invalid", code: "ustori_billing_version_unsupported", message: "UStori 返回的计费版本无法识别，不能确认金额单位" };
   if (body.billing_status === "reserved") return { status: "pending", code: "ustori_billing_pending", message: "UStori 视频已生成，正在等待上游完成结算" };
   if (body.billing_status !== "charged") return { status: "invalid", code: "ustori_billing_status_invalid", message: "UStori 已完成任务的扣款状态缺失或异常" };
+  if (credits !== null) {
+    if (amount != null && version == null) return { status: "pending", code: "ustori_billing_version_pending", message: "UStori 同时返回旧金额字段，正在等待计费版本以核对单位" };
+    if (amount != null && credits !== amount / 100000) return { status: "invalid", code: "ustori_billing_receipt_conflict", message: "UStori 返回的积分与旧金额字段不一致，无法确认最终费用" };
+    return null;
+  }
   if (amount == null) return { status: "pending", code: "ustori_billing_amount_pending", message: "UStori 已标记扣款，正在等待实际扣款金额" };
   if (version == null) return { status: "pending", code: "ustori_billing_version_pending", message: "UStori 已标记扣款，正在等待计费版本以确认金额单位" };
   return null;
 }
 
 function chargedCredits(ctx, body) {
-  // The authenticated task API returns microyuan, not credits: 1 credit is
-  // CNY 0.10 = 100,000 microyuan. Keep fractional credits and explicit zero.
-  // Only this billing version's units have been verified; do not guess when
-  // the provider changes them or substitute reserved_amount/standard_amount.
-  const amount = body?.charged_amount;
+  // New public receipts use credits directly. Legacy discount_cent_v1 receipts
+  // use microyuan: 1 credit = CNY 0.10 = 100,000 microyuan. Both represent the
+  // final charge, never the reservation or an undiscounted reference price.
   if (ctx.state?.billingMode !== CREDIT_BILLING || body?.id !== ctx.taskId ||
       body.model_name !== ctx.state.model || body.status !== "completed" ||
       finalBillingIssue(body) !== null) {
     return null;
   }
-  return amount / 100000;
+  return body.charged_credits != null ? parseCreditString(body.charged_credits) : body.charged_amount / 100000;
 }
 
 export function parseTaskResult(ctx, body) {

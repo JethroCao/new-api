@@ -288,6 +288,25 @@ func TestUStoriActualCreditSettlement(t *testing.T) {
 		quota   int
 	}{
 		{"same charge", nil, "SUCCESS", 16.5, 825000},
+		{"credit string settles without legacy fields", map[string]any{"charged_credits": "21.9", "charged_amount": nil, "billing_rule_version": nil}, "SUCCESS", 21.9, 1095000},
+		{"credit string refunds difference", map[string]any{"charged_credits": "8.30", "charged_amount": nil, "billing_rule_version": nil}, "SUCCESS", 8.3, 415000},
+		{"credit string zero", map[string]any{"charged_credits": "0.000", "charged_amount": nil, "billing_rule_version": nil}, "SUCCESS", 0, 0},
+		{"production 99 credits", map[string]any{"charged_credits": "99", "charged_amount": nil, "billing_rule_version": nil}, "SUCCESS", 99, 4950000},
+		{"small exact decimal credits", map[string]any{"charged_credits": "0.0000001", "charged_amount": nil, "billing_rule_version": nil}, "SUCCESS", 0.0000001, 0},
+		{"new credits with unversioned old amount", map[string]any{"charged_credits": "16.5", "billing_rule_version": nil}, "IN_PROGRESS", 0, 0},
+		{"matching old and new invoice", map[string]any{"charged_credits": "16.5"}, "SUCCESS", 16.5, 825000},
+		{"conflicting invoices", map[string]any{"charged_credits": "21.9"}, "UNKNOWN", 0, 0},
+		{"credit string still reserved", map[string]any{"charged_credits": "0", "charged_amount": nil, "billing_rule_version": nil, "billing_status": "reserved"}, "IN_PROGRESS", 0, 0},
+		{"numeric credits are not documented decimal strings", map[string]any{"charged_credits": 16.5}, "UNKNOWN", 0, 0},
+		{"negative credits", map[string]any{"charged_credits": "-1"}, "UNKNOWN", 0, 0},
+		{"exponential credits", map[string]any{"charged_credits": "1e3"}, "UNKNOWN", 0, 0},
+		{"whitespace credits", map[string]any{"charged_credits": " "}, "UNKNOWN", 0, 0},
+		{"boolean credits", map[string]any{"charged_credits": false}, "UNKNOWN", 0, 0},
+		{"object credits", map[string]any{"charged_credits": map[string]any{}}, "UNKNOWN", 0, 0},
+		{"credit precision loss", map[string]any{"charged_credits": "16.500000000000001"}, "UNKNOWN", 0, 0},
+		{"oversized credits", map[string]any{"charged_credits": "1000000001"}, "UNKNOWN", 0, 0},
+		{"invalid new credits must not fall back", map[string]any{"charged_credits": "invalid"}, "UNKNOWN", 0, 0},
+
 		{"discount refund", map[string]any{"charged_amount": 830000}, "SUCCESS", 8.3, 415000},
 		{"supplement", map[string]any{"charged_amount": 2000000}, "SUCCESS", 20, 1000000},
 		{"zero charge", map[string]any{"charged_amount": 0}, "SUCCESS", 0, 0},
@@ -407,6 +426,13 @@ func TestUStoriActualCreditSettlement(t *testing.T) {
 			assert.Equal(t, initial-tc.quota, token.RemainQuota)
 			assert.Equal(t, tc.quota, chargedTask.Quota)
 			assert.Equal(t, tc.quota, user.UsedQuota)
+			var billingLogs int64
+			require.NoError(t, db.Model(&model.Log{}).Where("user_id = ? AND type IN ?", user.Id, []int{model.LogTypeConsume, model.LogTypeRefund}).Count(&billingLogs).Error)
+			expectedLogs := int64(1)
+			if tc.quota != 825000 {
+				expectedLogs++
+			}
+			assert.Equal(t, expectedLogs, billingLogs, "repeated settlement must not add another wallet adjustment or billing log")
 			if tc.status == "FAILURE" {
 				return
 			}
