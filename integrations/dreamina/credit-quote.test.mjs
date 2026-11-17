@@ -235,15 +235,24 @@ test('storage failure after quotation cannot authorize a paid call',async t=>{
   assert.equal(f.calls.some(a=>a[0]==='node'&&['confirm','run'].includes(a[1])),false);
 });
 
-test('uncertain run recovers original submission without re-quote, approval, or generation',async t=>{
-  const f=await fixture(t,args=>{if(args[0]==='node'&&args[1]==='run')throw Error('transport lost');});
-  const accepted=await f.bridge.submit(request,'uncertain');await f.bridge.tick();
-  const quote=structuredClone(f.bridge.jobs.get(accepted.id).upstreamCreditQuote);
-  await f.bridge.close();const restored=await Bridge.open(f.config,f.cli);t.after(()=>restored.close());
-  await restored.tick();
-  assert.deepEqual(restored.jobs.get(accepted.id).upstreamCreditQuote,quote);
-  assert.equal(f.calls.filter(a=>a[0]==='node'&&a[1]==='run').length,1);
-  assert.equal(f.calls.filter(a=>a[0]==='node'&&a[1]==='quote').length,1);
+test('accepted and uncertain runs only recover the original operation, never recreate a missing draft',async t=>{
+  for(const uncertain of [false,true])await t.test(uncertain?'uncertain':'accepted',async t=>{
+    const f=await fixture(t,args=>{
+      if(args[1]==='run'&&uncertain)throw Error('transport lost');
+      if(args[1]==='show')return {nodes:[{nodeId:value(args,'node-id'),result:'NOT_FOUND'}]};
+    });
+    const accepted=await f.bridge.submit(request,'original-operation');await f.bridge.tick();
+    const job=f.bridge.jobs.get(accepted.id),quote=structuredClone(job.upstreamCreditQuote);
+    await f.bridge.close();const restored=await Bridge.open(f.config,f.cli);t.after(()=>restored.close());
+    await restored.tick();
+    assert.deepEqual(restored.jobs.get(accepted.id).upstreamCreditQuote,quote);
+    assert.equal(restored.get(accepted.id).status,'in_progress');
+    for(const command of ['create','quote','confirm','run'])assert.equal(f.calls.filter(a=>a[0]==='node'&&a[1]===command).length,1);
+    assert.equal(f.calls.some(a=>a[1]==='show'),false);
+    const polls=f.calls.filter(a=>a[0]==='operation');
+    assert.equal(polls.length,1);
+    assert.ok(polls[0][2].includes(job.submitId));
+  });
 });
 
 test('quotation parser uses only the private response header and drops malformed audit metadata without changing task status',()=>{
@@ -317,7 +326,7 @@ test('resuming an approved draft checks owned parameters and ignores unrelated c
     assert.equal(f.calls.filter(a=>a[1]==='create').length,1);
     assert.equal(f.calls.filter(a=>a[1]==='run').length,change==='canvas-version'?1:0);
     assert.equal(f.bridge.get(j.id).status,change==='canvas-version'?'in_progress':'failed');
-    if(change!=='canvas-version')assert.equal(f.bridge.get(j.id).error.code,'draft_changed');
+    if(change!=='canvas-version')assert.equal(f.bridge.get(j.id).error.code,change==='malformed-references'?'draft_save_unavailable':'draft_changed');
   });
 });
 
@@ -332,6 +341,102 @@ test('restart after saved draft but before quotation checks request alignment be
   restored.observe(j.id);await restored.tick();
   assert.equal(restored.get(j.id).error.code,'draft_changed');
   assert.equal(f.calls.some(a=>['create','quote','confirm','run'].includes(a[1])),false);
+});
+
+test('uncertain pure save recovers missing drafts under the original identity after restart',async t=>{
+  for(const shape of ['empty','NOT_FOUND','FOUND','legacy-found'])await t.test(shape,async t=>{
+    let saves=0;
+    const f=await fixture(t,(args)=>{
+      if(args[1]==='create' && ++saves===1)throw Object.assign(Error('save failed'),{
+        cliError:{code:'cli.transport_failed',message:'save response lost '+token+' https://example.test/private',request_id:'save-1'}});
+      if(args[1]==='show') {
+        const nodeId=value(args,'node-id');
+        const saved={nodeId,generation:{mode:'t2v',model:'seedance_2.5',ratio:'16:9',resolution:'480p',durationSeconds:5,outputCount:1,prompt:'waves',references:[]}};
+        return {nodes:shape==='empty'?[]:shape==='NOT_FOUND'?[{nodeId,result:'NOT_FOUND'}]:
+          shape==='FOUND'?[{nodeId,result:'FOUND',node:saved}]:[saved]};
+      }
+    });
+    const j=await f.bridge.submit(request,'save-recovery');await f.bridge.tick();
+    assert.equal(f.bridge.get(j.id).status,'queued');
+    const original=structuredClone(f.bridge.jobs.get(j.id));
+    await f.bridge.close();
+    const restored=await Bridge.open(f.config,f.cli);t.after(()=>restored.close());
+    await restored.observe(j.id);await restored.tick();
+    assert.equal(restored.get(j.id).status,'in_progress');
+    const creates=f.calls.filter(a=>a[1]==='create');
+    assert.equal(creates.length,['empty','NOT_FOUND'].includes(shape)?2:1);
+    for(const args of creates) {
+      assert.equal(value(args,'node-id'),original.nodeId);
+      assert.equal(value(args,'update-id'),original.updateId);
+      assert.equal(value(args,'project-id'),original.projectId || f.config.projectId);
+      assert.equal(args.includes('--run'),false);
+    }
+    assert.equal(f.calls.filter(a=>a[1]==='run').length,1);
+    assert.equal(value(f.calls.find(a=>a[1]==='run'),'submit-id'),original.submitId);
+    const disk=JSON.parse(await readFile(join(f.dir,j.id+'.json'),'utf8'));
+    assert.equal(disk.diagnostics.draft_save_error.code,'cli.transport_failed');
+    assert.equal(disk.diagnostics.draft_save_error.request_id,'save-1');
+    assert.equal(JSON.stringify(disk).includes(token),false);
+    assert.equal(JSON.stringify(disk).includes('https://example.test'),false);
+  });
+});
+
+test('missing or unreadable saved drafts never masquerade as changed drafts or authorize a run',async t=>{
+  for(const shape of ['empty','NOT_FOUND','unknown','malformed','empty-generation','invalid-count','conflicting','unrelated','duplicate'])await t.test(shape,async t=>{
+    const f=await fixture(t,args=>{
+      if(args[1]!=='show')return;
+      const nodeId=value(args,'node-id');
+      return {nodes:shape==='empty'?[]:shape==='unknown'?[{nodeId,result:'ERROR'}]:
+        shape==='malformed'?[{nodeId,result:'FOUND'}]:
+        shape==='empty-generation'?[{nodeId,result:'FOUND',node:{nodeId,generation:{}}}]:
+        shape==='invalid-count'?[{nodeId,generation:{mode:'t2v',model:'seedance_2.5',ratio:'16:9',resolution:'480p',durationSeconds:5,outputCount:'1',prompt:'waves',references:[]}}]:
+        shape==='conflicting'?[{nodeId,result:'NOT_FOUND',node:{nodeId,generation:{}}}]:
+        shape==='unrelated'?[{nodeId:'node_other',result:'NOT_FOUND'}]:
+        shape==='duplicate'?[{nodeId,result:'NOT_FOUND'},{nodeId,result:'NOT_FOUND'}]:[{nodeId,result:'NOT_FOUND'}]};
+    });
+    const j=await f.bridge.submit(request,'missing-saved');
+    const job=f.bridge.jobs.get(j.id);job.draftSaved=true;await f.bridge.save(job);
+    await f.bridge.tick();
+    assert.equal(f.bridge.get(j.id).error.code,'draft_save_unavailable');
+    assert.equal(f.calls.some(a=>['create','quote','confirm','run'].includes(a[1])),false);
+  });
+});
+
+test('unreadable save recovery preserves the first save error and does not replay a mutation',async t=>{
+  const f=await fixture(t,args=>{
+    if(args[1]==='create')throw Object.assign(Error('save failed'),{cliError:{code:2,message:'invalid draft parameters',diagnostics:[{detail:'reference height too small'}]}});
+    if(args[1]==='show')return {nodes:[{nodeId:value(args,'node-id'),result:'ERROR'}]};
+  });
+  const j=await f.bridge.submit(request,'save-error');await f.bridge.tick();await f.bridge.tick();
+  const result=f.bridge.get(j.id);
+  assert.equal(result.error.code,'draft_save_unavailable');
+  assert.equal(result.error.upstream_code,2);
+  assert.match(result.error.message,/invalid draft parameters/);
+  assert.match(result.error.message,/reference height too small/);
+  assert.equal(f.calls.filter(a=>a[1]==='create').length,1);
+  assert.equal(f.calls.some(a=>['quote','confirm','run'].includes(a[1])),false);
+});
+
+test('repeated pure save failures expire with the original cause and no accepted charge',async t=>{
+  let attempts=0;
+  const f=await fixture(t,args=>{
+    if(args[1]==='create')throw Object.assign(Error('save failed'),{cliError:++attempts===1?
+      {code:2,message:'invalid draft parameters'}:{code:'cli.transport_failed',message:'later transport error'}});
+    if(args[1]==='show')return {nodes:[{nodeId:value(args,'node-id'),result:'NOT_FOUND'}]};
+  });
+  const j=await f.bridge.submit(request,'save-expiry');await f.bridge.tick();await f.bridge.tick();
+  assert.equal(f.bridge.get(j.id).status,'queued');
+  const job=f.bridge.jobs.get(j.id);
+  job.created_at-=f.config.maxQueueWaitSeconds+1;await f.bridge.save(job);await f.bridge.tick();
+  const result=f.bridge.get(j.id);
+  assert.equal(result.status,'failed');
+  assert.equal(result.error.code,'queue_expired');
+  assert.equal(result.error.upstream_code,2);
+  assert.match(result.error.message,/invalid draft parameters/);
+  assert.equal(job.upstreamCreditQuote,undefined);
+  assert.equal(job.timings.accepted_at_ms,undefined);
+  assert.equal(f.calls.filter(a=>a[1]==='create').length,2);
+  assert.equal(f.calls.some(a=>['quote','confirm','run'].includes(a[1])),false);
 });
 
 test('unlimited policy still confirms exactly the frozen quote and checks leases',async t=>{

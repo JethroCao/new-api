@@ -89,16 +89,22 @@ function observeOutputResources(job, resources) {
   return true;
 }
 
-function matchesVideoDraft(node, job, request) {
-  if (node?.node) {
-    if (node.nodeId !== job.nodeId || node.result != null && node.result !== 'FOUND') return false;
-    node = node.node;
-  }
+function videoDraftState(shown, job, request) {
+  if (!Array.isArray(shown?.nodes)) return 'unavailable';
+  if (!shown.nodes.length) return 'missing'; // Legacy CLI empty lookup.
+  if (shown.nodes.length !== 1 || shown.nodes[0]?.nodeId !== job.nodeId) return 'unavailable';
+  let node = shown.nodes[0];
+  if (node.result === 'NOT_FOUND') return node.node == null && node.generation == null ? 'missing' : 'unavailable';
+  if (node.result != null && node.result !== 'FOUND') return 'unavailable';
+  if (node.node != null) node = node.node;
+  if (node?.nodeId !== job.nodeId || !node.generation || typeof node.generation !== 'object' || Array.isArray(node.generation)) return 'unavailable';
   const g=node?.generation,r=request,refs=g?.references??[];
-  return node?.nodeId===job.nodeId && g && g.model===r.model && g.mode===r.mode && g.prompt===r.prompt &&
+  if (!['model','mode','prompt','ratio','resolution'].every(key=>typeof g[key]==='string') ||
+      !Number.isFinite(g.durationSeconds) || !integer(g.outputCount,1,Number.MAX_SAFE_INTEGER) ||
+      !Array.isArray(refs) || !refs.every(ref=>ref && typeof ref.id==='string')) return 'unavailable';
+  return g.model===r.model && g.mode===r.mode && g.prompt===r.prompt &&
     g.ratio===r.ratio && g.resolution===r.resolution && g.durationSeconds===r.seconds && g.outputCount===r.n &&
-    Array.isArray(refs) && refs.every(ref=>ref && typeof ref.id==='string') &&
-    isDeepStrictEqual(refs.map(ref=>ref.id),(job.inputs||[]).map(input=>input.resourceId));
+    isDeepStrictEqual(refs.map(ref=>ref.id),(job.inputs||[]).map(input=>input.resourceId)) ? 'matching' : 'changed';
 }
 function equal(a, b) {
   const left = Buffer.from(a), right = Buffer.from(b);
@@ -1156,13 +1162,11 @@ export class Bridge {
         let shown;
         try { shown=await this.cli(['node','show',project,node]); }
         catch(error){this.failed(job,'draft_save_unavailable',error.cliError);await this.save(job);return;}
-        const saved=Array.isArray(shown?.nodes)?shown.nodes.find(n=>n?.nodeId===job.nodeId):undefined;
-        if(saved) {
-          if(!matchesVideoDraft(saved,job,r)) {
-            this.failed(job,'draft_changed');await this.save(job);return;
-          }
-          job.draftSaved=true;
-        } else if(!Array.isArray(shown?.nodes)) {this.failed(job,'draft_save_unavailable');await this.save(job);return;}
+        const state=videoDraftState(shown,job,r);
+        if(state==='changed' || state==='unavailable') {
+          this.failed(job,state==='changed'?'draft_changed':'draft_save_unavailable');await this.save(job);return;
+        }
+        if(state==='matching')job.draftSaved=true;
       }
       if(!job.draftSaved) {
         job.draftSaveAttempted=true;
@@ -1174,7 +1178,11 @@ export class Bridge {
         catch(error) {
           // A save has no generation side effect. Keep its identity for a
           // readback on the next leased attempt, bounded by the queue window.
-          job.attention='draft_save_pending';this.recordIssue(job,'save',error.cliError,'draft_save_pending');await this.save(job);return;
+          job.attention='draft_save_pending';
+          this.recordIssue(job,'save',error.cliError,'draft_save_pending');
+          // Preserve the first sanitized cause across readbacks and restarts.
+          job.diagnostics.draft_save_error ||= structuredClone(job.diagnostics.last_error);
+          await this.save(job);return;
         }
         if(saved?.node && saved.node.nodeId!==job.nodeId || !integer(saved?.mutation?.savedDraftVersion,0,Number.MAX_SAFE_INTEGER)) {
           this.failed(job,'draft_save_unavailable');await this.save(job);return;
@@ -1187,8 +1195,9 @@ export class Bridge {
       let shown;
       try {shown=await this.cli(['node','show',project,node]);}
       catch(error){this.failed(job,'draft_save_unavailable',error.cliError);await this.save(job);return;}
-      if(!matchesVideoDraft(Array.isArray(shown?.nodes)?shown.nodes.find(n=>n?.nodeId===job.nodeId):undefined,job,r)) {
-        this.failed(job,'draft_changed');await this.save(job);return;
+      const state=videoDraftState(shown,job,r);
+      if(state!=='matching') {
+        this.failed(job,state==='changed'?'draft_changed':'draft_save_unavailable');await this.save(job);return;
       }
     }
     let quoted;
@@ -1719,6 +1728,12 @@ export class Bridge {
   }
 
   failed(job, code, ...sources) {
+    // A later readback failure or queue expiry must not hide why the pure
+    // draft save failed. This never applies to an accepted generation failure.
+    if (code==='draft_save_unavailable' || code==='queue_expired' && !job.draftSaved) {
+      const original=job.diagnostics?.draft_save_error;
+      if(original)sources.unshift({code:original.code,message:original.message});
+    }
     const upstream = upstreamError(sources);
     let message = upstream.message || (upstream.code !== undefined ? 'Dreamina service error: ' + upstream.code : code.replaceAll('_', ' '));
     const quoteMessages={credit_reservation_exceeded:'即梦报价超过本次已预留积分，未提交生成，请联系管理员调整预留设置',draft_save_unavailable:'无法确认视频草稿已保存，未提交生成',draft_changed:'视频草稿参数已变化，未提交生成，请核对后重新提交',
