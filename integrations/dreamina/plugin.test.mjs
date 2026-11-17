@@ -92,9 +92,9 @@ test('prompt placeholders cannot inject private canvas references using whitespa
 test('upstream error text reaches task logs and public video responses with the original code',()=>{
   const body={status:'failed',error:{code:'generation_failed',upstream_code:20100,message:'内容不符合平台规则，请修改后重试',private:'secret'}};
   const parsed=p.parseTaskResult({},body,{status:200});
-  assert.equal(parsed.reason,body.error.message);
+  assert.equal(parsed.reason,'20100：'+body.error.message);
   const output=p.protocols.openai_video.render({},{status:'FAILURE',fail_reason:parsed.reason,data:body});
-  assert.deepEqual(output.error,{code:'video_generation_failed',message:body.error.message,upstream_code:20100});
+  assert.deepEqual(output.error,{code:'video_generation_failed',message:parsed.reason,upstream_code:20100});
   const legacy=p.protocols.openai_video.render({},{status:'FAILURE',fail_reason:'queue expired',data:{}});
   assert.deepEqual(legacy.error,{code:'video_generation_failed',message:'queue expired'});
 });

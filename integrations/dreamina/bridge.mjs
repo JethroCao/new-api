@@ -4,7 +4,7 @@ import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from
 import { mkdir, open, readFile, opendir, rename, unlink, lstat } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { isDeepStrictEqual } from 'node:util';
-import { VIDEO_MODELS, normalizeVideo, PROMOTION_UNSUPPORTED } from './plugin.js';
+import { VIDEO_MODELS, normalizeVideo, PROMOTION_UNSUPPORTED, formatUpstreamError } from './plugin.js';
 import {validateOSSConfig} from './oss-storage.mjs';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
@@ -860,7 +860,7 @@ export class Bridge {
 
   recordIssue(job, stage, source = {}, fallback = 'status_unavailable') {
     const upstream=upstreamError([source]);
-    const issue={code:upstream.code ?? fallback,message:this.errorMessage(upstream.message || fallback,upstream),stage,at_ms:Date.now()};
+    const issue={code:upstream.code ?? fallback,message:this.cleanMessage(upstream.message || fallback).slice(0,4096),stage,at_ms:Date.now()};
     if (upstream.reason) issue.reason = this.cleanMessage(upstream.reason);
     if (upstream.diagnostics) issue.diagnostics = upstream.diagnostics.map(d => ({detail:this.cleanMessage(d.detail).slice(0, 1024),
       ...(d.suggestion ? {suggestion:this.cleanMessage(d.suggestion).slice(0, 1024)} : {})}));
@@ -875,14 +875,6 @@ export class Bridge {
       .replace(/Bearer\s+[A-Za-z0-9._~+\/-]+=*/gi, 'Bearer [redacted]')
       .replace(/https?:\/\/[^\s<>"']+/gi, '[redacted URL]')
       .replace(/((?:access_token|refresh_token|api_key|token|signature|X-Tos-Signature)=)[^\s&]+/gi, '$1[redacted]');
-  }
-
-  errorMessage(message, source) {
-    // Details are for humans only, never evidence for retry/refund decisions.
-    // Include them in the existing message so stock plugin presenters retain
-    // them without changing the host or plugin response contract.
-    return [message, ...(source.diagnostics || []).flatMap(d =>
-      [d.detail, ...(d.suggestion ? [d.suggestion] : [])])].map(text => this.cleanMessage(text)).join('；').slice(0, 4096);
   }
 
   resumeUnverifiedCompletion(job) {
@@ -1732,29 +1724,25 @@ export class Bridge {
     // draft save failed. This never applies to an accepted generation failure.
     if (code==='draft_save_unavailable' || code==='queue_expired' && !job.draftSaved) {
       const original=job.diagnostics?.draft_save_error;
-      if(original)sources.unshift({code:original.code,message:original.message});
+      if(original)sources.unshift(original);
     }
     const upstream = upstreamError(sources);
-    let message = upstream.message || (upstream.code !== undefined ? 'Dreamina service error: ' + upstream.code : code.replaceAll('_', ' '));
+    let message = code.replaceAll('_', ' ');
     const quoteMessages={credit_reservation_exceeded:'即梦报价超过本次已预留积分，未提交生成，请联系管理员调整预留设置',draft_save_unavailable:'无法确认视频草稿已保存，未提交生成',draft_changed:'视频草稿参数已变化，未提交生成，请核对后重新提交',
       credit_quote_unavailable:'无法取得完整有效的即梦积分报价，未提交生成，请稍后重新提交',credit_quote_changed:'即梦积分报价已变化，未提交生成，请重新提交',
       credit_confirmation_unavailable:'无法确认本次积分消费授权，未提交生成，请稍后重新提交',
       credit_subject_unverified:'无法核实目标画布的即梦扣费账号和空间，已停止生成，请管理员核对渠道配置',
       credit_subject_mismatch:'即梦扣费账号或空间与当前渠道配置不一致，已停止生成，请管理员核对账号和团队'};
     if(quoteMessages[code] && !upstream.message)message=quoteMessages[code];
-    // Operator-confirmed meaning; keep the machine-readable upstream code.
-    if (String(upstream.code) === '20115') message = '20115:本次生成的输出视频未通过版权审核';
-    if (String(upstream.code) === '20100') message = '20100:本次输入文本敏感，已被安全审核拦截';
-    if (String(upstream.code) === '20110') message = '20110:输入图片版权校验未通过';
-    if (String(upstream.code) === '20005') message = '20005:即梦当前成员可用积分不足';
-    if (upstream.code === 'cli.operation_submission_absent') message = 'cli.operation_submission_absent：提交记录不存在或已过期';
     if (code === 'billing_quote_unavailable') message = '原转正任务的积分报价无法恢复，核查期限已到，未交付且未重新生成，请联系管理员核查原任务';
     if (code === 'artifact_expired') message = '原生成文件已超过保留期限，无法交付，请勿重新生成';
     if (code === 'download_failed') message = '视频已生成，但结果下载失败，重试次数已用尽：' + message;
-    if (upstream.code === 'cli.download_too_large') message = 'cli.download_too_large：视频已生成，但文件超过即梦 CLI 下载大小限制，无法交付';
-    if (upstream.code === 'media_download_too_large') message = 'media_download_too_large：视频已生成，但文件超过适配服务下载大小限制，无法交付';
-    // Public error text is retained; known credentials are never echoed.
-    message = this.errorMessage(message, upstream);
+    // An upstream message is authoritative, including its original language.
+    // Only errors with no upstream evidence use our local fallback wording.
+    // Diagnostics and recovery advice stay in their own response fields.
+    message = upstream.code !== undefined || upstream.message
+      ? formatUpstreamError(upstream.code, this.cleanMessage(upstream.message || ''))
+      : this.cleanMessage(message).slice(0,4096);
     job.status = 'failed';
     job.completed_at = Math.floor(Date.now()/1000);
     delete job.attention;

@@ -15,7 +15,7 @@ export const VIDEO_MODELS = {
 const MAX_INPUT_BYTES = 64 * 1024 * 1024;
 export const PROMOTION_UNSUPPORTED = '暂不支持样片转正，请直接创建普通视频任务';
 export const meta = {
-  apiVersion: 1, key: 'dreamina-cli', name: 'Dreamina CLI Video', icon: 'text:即梦', version: '0.3.1',
+  apiVersion: 1, key: 'dreamina-cli', name: 'Dreamina CLI Video', icon: 'text:即梦', version: '0.3.2',
   'author': { name: 'JethroCao' },
   'description': { en: 'Video generation through the official Dreamina Canvas CLI', zh: '通过官方即梦画布 CLI 生成视频' },
   'models': Object.keys(VIDEO_MODELS).concat(['dreamina-video']),
@@ -167,6 +167,18 @@ function seconds_parseSubmitResponse(ctx, response) {
   return {taskId:response.body.id,taskData:response.body,...(quote?{state:{creditQuote:quote}}:{})};
 }
 function seconds_buildQueryRequest(ctx) { return {url:base(ctx)+'/v1/jobs/'+encodeURIComponent(ctx.taskId),method:'GET',headers:auth(ctx)}; }
+// Shared by the adapter and plugin so old, unprefixed receipts also render
+// correctly. Recovery advice and diagnostics remain separate from raw errors.
+export function formatUpstreamError(code, message) {
+  const validCode = Number.isSafeInteger(code) && code !== 0 ||
+    typeof code === 'string' && /^[A-Za-z0-9_.:-]{1,128}$/.test(code) && code !== '0';
+  const text = typeof message === 'string' && message.trim() ? message : 'Dreamina did not provide an error message';
+  if (!validCode) return text.slice(0,4096);
+  const prefix=String(code);
+  if (text.startsWith(prefix+':') || text.startsWith(prefix+'：')) return text.slice(0,4096);
+  return (prefix+'：'+text).slice(0,4096);
+}
+
 function seconds_parseTaskResult(ctx, body, response) {
   if (response && response.status !== 200) throw new Error('Bridge query is temporarily unavailable');
   const statuses={queued:'QUEUED',in_progress:'IN_PROGRESS',completed:'SUCCESS',failed:'FAILURE'};
@@ -182,8 +194,8 @@ function seconds_parseTaskResult(ctx, body, response) {
     }
   }
   if (status==='SUCCESS') result.progress='100%';
-  if (status==='FAILURE') result.reason=body.error && body.error.message || 'Dreamina generation failed';
-  if (status==='FAILURE' && body.recovery && body.recovery.message) result.reason+='；'+String(body.recovery.message).slice(0,4096);
+  if (status==='FAILURE') result.reason=body.error
+    ? formatUpstreamError(body.error.upstream_code,body.error.message) : 'Dreamina generation failed';
   // Existing task log/details fields support text, so abnormal tasks need not
   // masquerade as a fixed 30% progress value or require a new gateway status.
   const action=body && body.recovery && body.recovery.action;
@@ -248,6 +260,9 @@ export const protocols={openai_video:{decodeRequest:decode,render:function(ctx,t
     if(e) {
       result.diagnostics.last_error={};
       for(const key of ['code','message','request_id','stage','at_ms','resolved_at_ms'])if(typeof e[key]==='string' || Number.isSafeInteger(e[key]))result.diagnostics.last_error[key]=e[key];
+      if(Array.isArray(e.diagnostics))result.diagnostics.last_error.diagnostics=e.diagnostics.slice(0,8).flatMap(d=>
+        d && typeof d.detail==='string' ? [{detail:d.detail.slice(0,1024),
+          ...(typeof d.suggestion==='string'?{suggestion:d.suggestion.slice(0,1024)}:{})}] : []);
     }
   }
   if(task.status==='FAILURE') {
@@ -261,7 +276,7 @@ export const protocols={openai_video:{decodeRequest:decode,render:function(ctx,t
 // Generated credit variant; rebuild with build-credit-plugin.mjs.
 const CREDIT_MODELS=["seedance_2.5","seedance_2.5_flash","seedance_2.5_draft","seedance_2.0_vip","seedance_2.0_fast_vip","seedance_2.0_mini","seedance_pro_fast","happyhorse_1.1","wan_3.0"];
 // Appended to the shared, self-contained protocol by build-credit-plugin.mjs.
-meta.version='1.5.0';
+meta.version='1.5.1';
 meta.models=CREDIT_MODELS.concat(CREDIT_MODELS.includes('seedance_2.5')?['dreamina-video']:[]);
 meta.usageSchema={
  credits:{type:'number',unit:'credit',description:{en:'Dreamina credit unit price',zh:'即梦积分单价'}},

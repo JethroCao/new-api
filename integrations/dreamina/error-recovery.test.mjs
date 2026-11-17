@@ -34,13 +34,14 @@ async function setup(t, operation, submit, options = {}) {
 }
 
 test('terminal operation failure overrides pending resources and preserves safe reason',async t=>{
-  for(const [code,message,action] of [
-    [20005,'20005:即梦当前成员可用积分不足','add_credits_then_resubmit'],
-    [20100,'20100:本次输入文本敏感，已被安全审核拦截','fix_input_then_resubmit'],
-    ['20100','20100:本次输入文本敏感，已被安全审核拦截','fix_input_then_resubmit'],
-    [20110,'20110:输入图片版权校验未通过','fix_input_then_resubmit'],
-    [20115,'20115:本次生成的输出视频未通过版权审核','fix_input_then_resubmit'],
-  ])await t.test(String(code),async t=>{
+  for(const [code,action] of [
+    [20005,'add_credits_then_resubmit'],
+    [20100,'fix_input_then_resubmit'],
+    ['20100','fix_input_then_resubmit'],
+    [20110,'fix_input_then_resubmit'],
+    [20115,'fix_input_then_resubmit'],
+    ])await t.test(String(code),async t=>{
+    const message=code+'：upstream rejection';
     const f=await setup(t,()=>({state:'failed',submission:{state:'completed'},submissionError:{serviceCode:code,message:'upstream rejection',retryable:false},resources:[{resourceId:'r',state:'pending'}]}));
     await f.bridge.tick();await f.bridge.tick();
     const b=f.bridge.get(f.job.id);
@@ -48,7 +49,7 @@ test('terminal operation failure overrides pending resources and preserves safe 
     assert.equal(b.recovery.action,action);assert.equal(b.recovery.automatic_resubmit,false);
     assert.equal(b.diagnostics.last_error.message,'upstream rejection');assert.ok(b.completed_at);
     assert.equal(f.runs(),1);
-    const parsed=plugin.parseTaskResult({},b,{status:200});assert.equal(parsed.status,'FAILURE');assert.equal(parsed.reason,message+'；'+b.recovery.message);
+    const parsed=plugin.parseTaskResult({},b,{status:200});assert.equal(parsed.status,'FAILURE');assert.equal(parsed.reason,message);
     const rendered=plugin.protocols.openai_video.render({},{status:'FAILURE',fail_reason:parsed.reason,data:b});
     assert.equal(rendered.recovery.action,action);assert.equal(rendered.error.upstream_code,code);
   });
@@ -97,17 +98,17 @@ test('missing submission fails with a public reason and stays terminal through r
   const b=f.bridge.get(f.job.id);
   assert.equal(b.status,'failed');assert.equal(b.attention,undefined);
   assert.equal(b.error.upstream_code,'cli.operation_submission_absent');
-  assert.equal(b.error.message,'cli.operation_submission_absent：提交记录不存在或已过期');
+  assert.equal(b.error.message,'cli.operation_submission_absent：Submission absent');
   assert.equal(b.diagnostics.last_error.code,'cli.operation_submission_absent');
   assert.equal(b.diagnostics.last_error.message,'Submission absent');
   assert.equal(b.diagnostics.last_error.request_id,'request-123');
   assert.equal(b.diagnostics.next_poll_at_ms,0);
   assert.equal(b.recovery.automatic_resubmit,false);
   const parsed=plugin.parseTaskResult({},b,{status:200});
-  assert.equal(parsed.status,'FAILURE');assert.match(parsed.reason,/提交记录不存在或已过期/);
+  assert.equal(parsed.status,'FAILURE');assert.equal(parsed.reason,b.error.message);
   const rendered=plugin.protocols.openai_video.render({},{status:'FAILURE',fail_reason:parsed.reason,data:b});
   assert.equal(rendered.error.upstream_code,'cli.operation_submission_absent');
-  assert.match(rendered.error.message,/提交记录不存在或已过期/);
+  assert.equal(rendered.error.message,b.error.message);
   await f.bridge.close();const reopened=await Bridge.open(f.cfg,f.cli);t.after(()=>reopened.close());
   await reopened.tick();assert.equal(reopened.get(f.job.id).status,'failed');assert.equal(f.runs(),1);
 });
@@ -203,8 +204,9 @@ test('1.3 error details survive parsing, persistence and presentation with crede
   const receipt=restored.get(f.job.id);
   assert.equal(receipt.diagnostics.last_error.reason,'invalid_reference');
   const output=plugin.protocols.openai_video.render({},{status:'IN_PROGRESS',data:receipt});
-  assert.match(output.diagnostics.last_error.message,/Unsupported reference/);
-  assert.match(output.diagnostics.last_error.message,/Check type/);
+  assert.equal(output.diagnostics.last_error.message,'The request parameters are invalid.');
+  assert.match(output.diagnostics.last_error.diagnostics[0].detail,/Unsupported reference/);
+  assert.match(output.diagnostics.last_error.diagnostics[0].suggestion,/Check type/);
   for(const secret of ['hidden-bearer','hidden-url','hidden-token','hidden-private','hidden-path'])assert.equal(JSON.stringify(receipt).includes(secret),false);
 });
 
@@ -213,8 +215,8 @@ test('rejected run diagnostics cannot persist the credit confirmation token',asy
     const f=await setup(t,()=>{throw Error('must not query a rejected run');},()=>({submission:{state:'rejected',error:{code:20110,message:'Rejected',
       diagnostics:[{detail:padding+'Rejected fixture-approval',suggestion:'Do not retry fixture-approval'}]}}}));
     const b=f.bridge.get(f.job.id);
-    assert.equal(b.status,'failed');assert.match(b.error.message,/输入图片版权校验未通过/);
-    assert.match(b.error.message,/Do not retry \[redacted\]/);
+    assert.equal(b.status,'failed');assert.equal(b.error.message,'20110：Rejected');
+    assert.match(b.diagnostics.last_error.diagnostics[0].suggestion,/Do not retry \[redacted\]/);
     assert.equal(JSON.stringify(b).includes('fixture-'),false);
   });
 });
@@ -263,4 +265,38 @@ test('diagnostics redact credentials and signed media URLs before persistence an
   for(const secret of ['secret-bearer','secret-query','secret-url',f.cfg.token])assert.equal(JSON.stringify(output).includes(secret),false);
   assert.equal(output.diagnostics.last_error.request_id,'req-123');
   assert.equal(output.recovery.action,'retry_query');
+});
+
+
+test('original upstream errors have one code prefix in the bridge and both plugin variants',async t=>{
+  const creditPlugin=await import('data:text/javascript;base64,'+Buffer.from(await buildCreditPlugin({models:['seedance_2.5']})).toString('base64'));
+  for(const [error,expected] of [
+    [{serviceCode:20117,message:'Input audio copyright verification failed.'},'20117：Input audio copyright verification failed.'],
+    [{errorCode:'20117',errorMessage:'Input audio copyright verification failed.'},'20117：Input audio copyright verification failed.'],
+    [{code:20117,message:'20117: Input audio copyright verification failed.'},'20117: Input audio copyright verification failed.'],
+    [{code:20117,message:'20117：Input audio copyright verification failed.'},'20117：Input audio copyright verification failed.'],
+    [{code:20999},'20999：Dreamina did not provide an error message'],
+    [{message:'Uncoded rejection'},'Uncoded rejection'],
+    [{code:'cli.rejected',message:'Original rejection'},'cli.rejected：Original rejection'],
+    [{code:20110,message:'原始中文说明'},'20110：原始中文说明'],
+    [{code:20110,message:'Rejected Bearer secret-value https://private.test/file',diagnostics:[{detail:'Private diagnostic',suggestion:'Do not retry'}]},'20110：Rejected Bearer [redacted] [redacted URL]'],
+  ])await t.test(expected,async t=>{
+    const f=await setup(t,()=>({state:'failed',resources:[{resourceId:'r',state:'failed',...error}]}),undefined,{
+      request:{model:'seedance_2.5',resolution:'480p'},billing:{version:2,request_id:'job',reserved_credits:60}});
+    const ctx={publicTaskId:'job',model:'seedance_2.5',upstreamModel:'seedance_2.5',requestBody:{prompt:'waves',seconds:5,resolution:'480p'}};
+    const poll={taskId:f.job.id,publicTaskId:'job',state:creditPlugin.parseSubmitResponse(ctx,{body:f.bridge.get(f.job.id)}).state};
+    await f.bridge.tick();const body=f.bridge.get(f.job.id);
+    assert.equal(body.error.message,expected);assert.equal(f.runs(),1);
+    for(const p of [plugin,creditPlugin]){
+      const parsed=p.parseTaskResult(poll,body,{status:200});
+      assert.equal(parsed.status,'FAILURE');assert.equal(parsed.reason,expected);
+      const rendered=p.protocols.openai_video.render({},{status:'FAILURE',fail_reason:parsed.reason,data:body});
+      assert.equal(rendered.error.message,expected);
+      assert.deepEqual(p.extractUsageOnComplete({},parsed,body),{});
+    }
+    await f.bridge.close();const restored=await Bridge.open(f.cfg,f.cli);t.after(()=>restored.close());
+    await restored.tick();assert.equal(restored.get(f.job.id).error.message,expected);assert.equal(f.runs(),1);
+  });
+  const oldBody={id:'legacy-job',object:'video',model:'seedance_2.5',seconds:5,n:1,mode:'t2v',resolution:'480p',ratio:'16:9',billing_mode:'legacy_seconds',status:'failed',error:{upstream_code:20117,message:'Input audio copyright verification failed.'},recovery:{message:'请勿重新生成'}};
+  for(const p of [plugin,creditPlugin])assert.equal(p.parseTaskResult({taskId:'legacy-job',data:oldBody},oldBody,{status:200}).reason,'20117：Input audio copyright verification failed.');
 });

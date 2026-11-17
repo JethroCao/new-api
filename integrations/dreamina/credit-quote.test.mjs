@@ -412,7 +412,12 @@ test('unreadable save recovery preserves the first save error and does not repla
   assert.equal(result.error.code,'draft_save_unavailable');
   assert.equal(result.error.upstream_code,2);
   assert.match(result.error.message,/invalid draft parameters/);
-  assert.match(result.error.message,/reference height too small/);
+  assert.equal(result.error.message,'2：invalid draft parameters');
+  assert.equal(result.diagnostics.draft_save_error.diagnostics[0].detail,'reference height too small');
+  const parsed=plugin.parseTaskResult({},result,{status:200});
+  const rendered=plugin.protocols.openai_video.render({},{status:'FAILURE',fail_reason:parsed.reason,data:result});
+  assert.equal(rendered.error.message,'2：invalid draft parameters');
+  assert.equal(rendered.diagnostics.last_error.diagnostics[0].detail,'reference height too small');
   assert.equal(f.calls.filter(a=>a[1]==='create').length,1);
   assert.equal(f.calls.some(a=>['quote','confirm','run'].includes(a[1])),false);
 });

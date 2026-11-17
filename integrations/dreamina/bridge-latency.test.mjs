@@ -167,12 +167,12 @@ test('oversized download fails visibly without resubmission and remains terminal
   j.status='in_progress';j.terminalOperationState='succeeded';j.downloadResources=['output'];await bridge.save(j);
   await bridge.tick();const result=bridge.get(j.id);
   assert.equal(result.status,'failed');assert.equal(result.error.upstream_code,'cli.download_too_large');
-  assert.match(result.error.message,/视频已生成.*下载.*大小限制/);
+  assert.equal(result.error.message,'cli.download_too_large：The media response exceeds the permitted download size.');
   assert.equal(result.diagnostics.last_error.request_id,'download-123');
   assert.equal(result.diagnostics.last_error.message,'The media response exceeds the permitted download size.');
   assert.equal(result.recovery.automatic_resubmit,false);assert.match(result.recovery.message,/请勿重新生成/);
   const parsed=plugin.parseTaskResult({},result,{status:200});
-  assert.equal(parsed.status,'FAILURE');assert.match(parsed.reason,/cli.download_too_large.*下载大小限制/);
+  assert.equal(parsed.status,'FAILURE');assert.equal(parsed.reason,result.error.message);
   const rendered=plugin.protocols.openai_video.render({},{status:'FAILURE',fail_reason:parsed.reason,data:result});
   assert.equal(rendered.error.upstream_code,'cli.download_too_large');
   await bridge.close();calls.length=0;
@@ -209,7 +209,7 @@ test('download retries back off durably and exhaust without a new generation',as
     await restored.tick();assert.equal(restored.get(j.id).diagnostics.download_failures,i);
   }
   const result=restored.get(j.id);assert.equal(result.status,'failed');assert.equal(result.error.upstream_code,'cli.transport_failed');
-  assert.match(result.error.message,/下载失败.*重试/);assert.equal(result.diagnostics.next_download_at_ms,0);
+  assert.equal(result.error.message,'cli.transport_failed：Temporary transport error');assert.equal(result.diagnostics.next_download_at_ms,0);
   await restored.tick();assert.equal(calls.filter(a=>a[0]==='resource').length,4);
   assert.equal(calls.some(a=>['node','operation'].includes(a[0])),false);
 });

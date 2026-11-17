@@ -551,7 +551,7 @@ test('historical accepted promotion failure preserves the upstream error without
   const result=restored.get(job.id);
   assert.equal(result.status,'failed');
   assert.equal(result.error.upstream_code,20115);
-  assert.match(result.error.message,/本次生成的输出视频未通过版权审核/);
+  assert.equal(result.error.message,'20115：Dreamina did not provide an error message');
   assert.equal(result.billing_mode,'legacy_seconds');
   assert.equal(polls,1);
 });
@@ -629,7 +629,7 @@ test('terminal upstream failures preserve original codes and messages without pr
     const err=bridge.get(j.id).error;
     assert.equal(err.code,'generation_failed');
     assert.equal(err.upstream_code,upstream.error?.code || 20999);
-    assert.equal(err.message,upstream.error?.message || upstream.resources[0].errorMessage || 'Dreamina service error: 20999');
+    assert.equal(err.message,String(err.upstream_code)+'：'+(upstream.error?.message || upstream.resources[0].errorMessage || 'Dreamina did not provide an error message'));
     assert.equal(JSON.stringify(err).includes('secret'),false);
   });
 });
@@ -638,10 +638,10 @@ test('explicit submission rejection keeps the upstream reason', async t => {
   const {bridge}=await videoFixture(t,async()=>({submission:{state:'rejected',error:{code:'INPUT_REJECTED',message:'Unsupported reference image'}}}));
   const j=await bridge.submit({kind:'video',model:'seedance_2.5',prompt:'waves'},'reject');
   await bridge.tick();
-  assert.deepEqual(bridge.get(j.id).error,{code:'submission_rejected',message:'Unsupported reference image',upstream_code:'INPUT_REJECTED'});
+  assert.deepEqual(bridge.get(j.id).error,{code:'submission_rejected',message:'INPUT_REJECTED：Unsupported reference image',upstream_code:'INPUT_REJECTED'});
 });
 
-test('copyright rejection 20115 has Chinese text in task logs and public video errors', async t => {
+test('copyright rejection preserves original wording in task logs and public video errors', async t => {
   const plugin = await import('./plugin.js');
   for (const code of [20115, '20115']) {
     const {bridge}=await videoFixture(t,async a=>a[0]==='node'
@@ -651,7 +651,7 @@ test('copyright rejection 20115 has Chinese text in task logs and public video e
     await bridge.tick();await bridge.tick();
     const body=bridge.get(job.id);
     const parsed=plugin.parseTaskResult({},body,{status:200});
-    assert.equal(parsed.reason,'20115:本次生成的输出视频未通过版权审核；请修改输入内容后重新提交，不自动重试');
+    assert.equal(parsed.reason,'20115：Dreamina service error: 20115');
     const output=plugin.protocols.openai_video.render({},{status:'FAILURE',fail_reason:parsed.reason,data:body});
     assert.deepEqual(output.error,{code:'video_generation_failed',message:parsed.reason,upstream_code:code});
   }
