@@ -30,7 +30,14 @@ const identityRecoveryCodes = new Set([
   'cli.auth_required', 'cli.authentication_required', 'cli.auth_refresh_failed', 'cli.auth_refresh_unavailable',
   'cli.auth_state_failed', 'cli.auth_unavailable', 'cli.context_changed', 'cli.canvas_space_mismatch',
   'cli.operation_context_invalid', 'cli.operation_context_mismatch', 'cli.operation_identity_unknown',
+  // CLI 1.3: authentication required, unverifiable identity, context mismatch.
+  '3', '40003', '40016',
 ]);
+const generationRejectionCodes = new Set(['20005', '20100', '20110', '20115']);
+function requiresIdentityRecovery(error) {
+  return identityRecoveryCodes.has(String(error?.code)) ||
+    ['account_changed', 'credential_store_permission_denied', 'credential_store_unavailable', 'credential_store_corrupt'].includes(error?.reason);
+}
 // Team names can change; the CLI returns account and team IDs as exact strings.
 function consumptionSubjectError(subject, config) {
   if (!subject || typeof subject.userId !== 'string' || !subject.userId ||
@@ -146,7 +153,7 @@ export function validateConfig(input) {
 }
 
 // Select public error fields only. Never persist the entire upstream envelope.
-function upstreamError(sources) {
+function upstreamError(sources, creditToken) {
   const result = {};
   for (const source of sources) {
     if (!source || typeof source !== 'object') continue;
@@ -156,9 +163,23 @@ function upstreamError(sources) {
       const code = Number.isSafeInteger(rawCode) && rawCode !== 0 ? rawCode
         : typeof rawCode === 'string' && /^[A-Za-z0-9_.:-]{1,128}$/.test(rawCode) && rawCode !== '0' ? rawCode : undefined;
       const rawMessage = candidate.errorMessage ?? candidate.serviceMessage ?? candidate.message;
-      const message = typeof rawMessage === 'string' && rawMessage.trim() ? rawMessage.slice(0, 4096) : undefined;
+      const message = typeof rawMessage === 'string' && rawMessage.trim()
+        ? (creditToken ? rawMessage.replaceAll(creditToken, '[redacted]') : rawMessage).slice(0, 4096) : undefined;
       if (result.code === undefined && code !== undefined) result.code = code;
       if (result.message === undefined && message !== undefined) result.message = message;
+      if (result.reason === undefined && typeof candidate.reason === 'string' && /^[A-Za-z0-9_.:-]{1,128}$/.test(candidate.reason)) result.reason = candidate.reason;
+      if (result.diagnostics === undefined && Array.isArray(candidate.diagnostics)) {
+        const diagnostics = candidate.diagnostics.slice(0, 8).flatMap(d => {
+          if (!d || typeof d.detail !== 'string' || !d.detail.trim()) return [];
+          const detail = creditToken ? d.detail.replaceAll(creditToken, '[redacted]') : d.detail;
+          const suggestion = typeof d.suggestion === 'string' && d.suggestion.trim()
+            ? (creditToken ? d.suggestion.replaceAll(creditToken, '[redacted]') : d.suggestion) : undefined;
+          // CLI output is capped at 2 MiB. Bound persisted text only after
+          // redacting credentials; an earlier cut could retain half a secret.
+          return [{detail, ...(suggestion ? {suggestion} : {})}];
+        });
+        if (diagnostics.length) result.diagnostics = diagnostics;
+      }
       if (result.code !== undefined && result.message !== undefined) return result;
     }
   }
@@ -167,12 +188,15 @@ function upstreamError(sources) {
 
 function redactCreditToken(source, token) {
   const safe={...source};
-  for(const key of ['code','message','request_id'])if(typeof safe[key]==='string')safe[key]=safe[key].replaceAll(token,'[redacted]');
+  for(const key of ['code','message','request_id','reason'])if(typeof safe[key]==='string')safe[key]=safe[key].replaceAll(token,'[redacted]');
+  if (safe.diagnostics) safe.diagnostics = safe.diagnostics.map(d => Object.fromEntries(
+    Object.entries(d).map(([key, value]) => [key, value.replaceAll(token, '[redacted]')])));
   return safe;
 }
 
 // argv is passed without a shell. User text stays one --prompt=<value> argument.
 export function runCLI(executable, args, timeout = 120000) {
+  const creditToken = args.find(arg => arg.startsWith('--credit-token='))?.slice('--credit-token='.length);
   return new Promise((resolvePromise, reject) => {
     const child = spawn(executable, args, { shell: false, stdio: ['ignore', 'pipe', 'pipe'] });
     const chunks = [], stderr = []; let bytes = 0; let failure;
@@ -199,7 +223,7 @@ export function runCLI(executable, args, timeout = 120000) {
             try {
               const envelope=JSON.parse(line);
               if(envelope.ok!==false || !envelope.error)continue;
-              cliError=upstreamError([envelope.error]);
+              cliError=upstreamError([envelope.error],creditToken);
               const requestId=envelope.meta?.requestId;
               if(typeof requestId==='string' && /^[A-Za-z0-9_.:-]{1,160}$/.test(requestId))cliError.request_id=requestId;
               break;
@@ -810,6 +834,8 @@ export class Bridge {
       action='retry_upload';message='视频已生成，正在上传存储，请勿重新生成';
     } else if (['context_mismatch','context_unverified'].includes(job.attention)) {
       action = 'manual_review'; message = '请管理员核对原渠道的 CLI 账号和空间，系统将按原任务重查，请勿重新生成';
+    } else if (job.attention === 'submission_record_missing') {
+      action = 'manual_review'; message = '即梦任务已有受理或产物记录，但提交记录暂不可查询，保留原任务核查，请勿重新生成';
     } else if(job.downloadResources){action='retry_download';message='正在获取生成结果，请勿重新生成';}
     else if(['manual_recovery_required','submission_uncertain','operation_mismatch','resources_missing','resource_count_mismatch','invalid_resource_id'].includes(job.attention)){
       action='manual_review';message='提交状态待核查，请勿重复提交';
@@ -828,7 +854,10 @@ export class Bridge {
 
   recordIssue(job, stage, source = {}, fallback = 'status_unavailable') {
     const upstream=upstreamError([source]);
-    const issue={code:upstream.code ?? fallback,message:this.cleanMessage(upstream.message || fallback),stage,at_ms:Date.now()};
+    const issue={code:upstream.code ?? fallback,message:this.errorMessage(upstream.message || fallback,upstream),stage,at_ms:Date.now()};
+    if (upstream.reason) issue.reason = this.cleanMessage(upstream.reason);
+    if (upstream.diagnostics) issue.diagnostics = upstream.diagnostics.map(d => ({detail:this.cleanMessage(d.detail).slice(0, 1024),
+      ...(d.suggestion ? {suggestion:this.cleanMessage(d.suggestion).slice(0, 1024)} : {})}));
     if(typeof source.request_id==='string' && /^[A-Za-z0-9_.:-]{1,160}$/.test(source.request_id))issue.request_id=source.request_id;
     job.diagnostics ||= {};
     job.diagnostics.last_error=issue;
@@ -840,6 +869,14 @@ export class Bridge {
       .replace(/Bearer\s+[A-Za-z0-9._~+\/-]+=*/gi, 'Bearer [redacted]')
       .replace(/https?:\/\/[^\s<>"']+/gi, '[redacted URL]')
       .replace(/((?:access_token|refresh_token|api_key|token|signature|X-Tos-Signature)=)[^\s&]+/gi, '$1[redacted]');
+  }
+
+  errorMessage(message, source) {
+    // Details are for humans only, never evidence for retry/refund decisions.
+    // Include them in the existing message so stock plugin presenters retain
+    // them without changing the host or plugin response contract.
+    return [message, ...(source.diagnostics || []).flatMap(d =>
+      [d.detail, ...(d.suggestion ? [d.suggestion] : [])])].map(text => this.cleanMessage(text)).join('；').slice(0, 4096);
   }
 
   resumeUnverifiedCompletion(job) {
@@ -1210,7 +1247,7 @@ export class Bridge {
         submitted?.nodeId === job.nodeId && submitted?.submitId === job.submitId;
       const state = matches ? String(submitted.state).toLowerCase() : '';
       if (state === 'rejected') {
-        this.failed(job, 'submission_rejected', redactCreditToken(upstreamError([submitted]), approval.creditConfirmationToken));
+        this.failed(job, 'submission_rejected', redactCreditToken(upstreamError([submitted], approval.creditConfirmationToken), approval.creditConfirmationToken));
       } else {
         if (['accepted', 'completed', 'in_progress'].includes(state)) this.recordTime(job, 'accepted_at_ms');
         else job.attention = 'submission_uncertain';
@@ -1229,7 +1266,7 @@ export class Bridge {
     } catch(error) {
       const publicError=redactCreditToken(error.cliError,approval.creditConfirmationToken);
       if(error.exitCode===10)this.failed(job,'credit_approval_required');
-      else if(['20005','20100','20110','20115'].includes(String(publicError.code)))this.failed(job,'submission_rejected',publicError);
+      else if(generationRejectionCodes.has(String(publicError.code)))this.failed(job,'submission_rejected',publicError);
       else {job.attention='submission_uncertain';this.recordIssue(job,'submit',publicError,'submission_uncertain');}
     }
     await this.save(job);
@@ -1385,7 +1422,7 @@ export class Bridge {
       } catch (error) {
         // Exit 10 is documented as quotation awaiting approval, without debit.
         if (error.exitCode === 10) this.failed(job, 'credit_approval_required');
-        else if(['20005','20100','20110','20115'].includes(String(error.cliError?.code))) this.failed(job,'submission_rejected',error.cliError);
+        else if(generationRejectionCodes.has(String(error.cliError?.code))) this.failed(job,'submission_rejected',error.cliError);
         else {
           job.attention = 'submission_uncertain';
           this.recordIssue(job,'submit',error.cliError,'submission_uncertain');
@@ -1404,15 +1441,28 @@ export class Bridge {
       job.timings.last_poll_finished_at_ms = Date.now();
       job.timings.poll_error_count = (job.timings.poll_error_count || 0) + 1;
       if (error.cliError?.code === 'cli.operation_submission_absent') {
-        // Missing/expired records are terminal by operator policy. This does
-        // not prove the original submission was uncharged; keep any recorded
-        // run conflict for review and never resubmit the operation.
+        // Losing the upstream record cannot undo prior acceptance or output
+        // evidence. Legacy jobs may have resources but no acceptance timings.
+        const accepted = job.timings.accepted_at_ms !== undefined || job.timings.accepted_observed_at_ms !== undefined ||
+          job.runConflict || [job.observedResourceIds,job.observedSuccessIds,job.unverifiedDownloadResources,job.files]
+            .some(items => Array.isArray(items) && items.length > 0);
+        if (accepted) {
+          job.attention = job.runConflict ? 'run_conflict' : 'submission_record_missing';
+          this.recordIssue(job,'query',error.cliError);
+          job.diagnostics.consecutive_query_errors=(job.diagnostics.consecutive_query_errors || 0)+1;
+          job.diagnostics.next_poll_at_ms=Date.now()+60000;
+          await this.save(job); return;
+        }
+        // Preserve the existing missing-record policy for jobs without any
+        // recorded acceptance/output evidence. Never resubmit either case.
         this.failed(job, 'submission_absent', error.cliError);
         this.recordIssue(job, 'terminal', error.cliError);
         await this.save(job); return;
       }
       this.onEvent?.({event:'dreamina_poll',job_id:job.id,at_ms:Date.now(),duration_ms:Date.now()-polledAt,state:'status_unavailable',poll_count:job.timings.poll_count});
-      const uncertain=['cli.operation_identity_unknown','cli.operation_context_mismatch'].includes(error.cliError?.code);
+      // 40012 covers uncertain operations, not just missing submissions. It
+      // cannot inherit the old submission_absent automatic failure policy.
+      const uncertain=requiresIdentityRecovery(error.cliError) || String(error.cliError?.code)==='40012';
       job.attention = job.runConflict ? 'run_conflict' : uncertain ? 'manual_recovery_required' : 'status_unavailable';
       this.recordIssue(job,'query',error.cliError,'status_unavailable');
       job.diagnostics.consecutive_query_errors=(job.diagnostics.consecutive_query_errors || 0)+1;
@@ -1437,8 +1487,11 @@ export class Bridge {
     const submission = String(operation.submission?.state).toLowerCase();
     // An ambiguous submission cannot promote cached resources to evidence
     // of acceptance or delivery. Only query the same submit ID again.
-    if (state === 'unknown' || ['absent','unknown','awaiting_confirmation'].includes(submission)) {
+    const outcome = String(operation.submissionOutcome).toLowerCase();
+    if (['unknown','awaiting_confirmation'].includes(state) || outcome === 'unknown' || ['absent','unknown','awaiting_confirmation'].includes(submission) ||
+        requiresIdentityRecovery(operation.submissionError) || String(operation.submissionError?.code) === '40012') {
       job.attention = job.runConflict ? 'run_conflict' : 'manual_recovery_required';
+      if (operation.submissionError) this.recordIssue(job,'query',operation.submissionError,'submission_uncertain');
       job.diagnostics.next_poll_at_ms = Date.now() + 60000;
       await this.save(job); return;
     }
@@ -1478,8 +1531,11 @@ export class Bridge {
     const serviceCode = operation.submissionError?.serviceCode;
     const hasServiceCode = (Number.isSafeInteger(serviceCode) && serviceCode > 0) ||
       (typeof serviceCode === 'string' && /^[1-9]\d{0,15}$/.test(serviceCode));
-    const refusal = submission === 'rejected' ||
-      (failed && hasServiceCode && operation.submissionError?.retryable === false);
+    // 1.2 supplied serviceCode + retryable. 1.3 supplies code instead;
+    // accept only known generation refusals, not arbitrary numeric CLI errors.
+    const refusal = submission === 'rejected' || outcome === 'rejected' ||
+      (failed && ((hasServiceCode && operation.submissionError?.retryable === false) ||
+        (generationRejectionCodes.has(String(operation.submissionError?.code)) && operation.submissionError?.retryable !== true)));
     const outstanding = [...job.observedResourceStates.map(([, state]) => state), ...resources.filter(r => !r.resourceId).map(r => r.state)]
       .some(state => !['succeeded', 'failed'].includes(state) && !(refusal && state === 'pending'));
     if (outstanding) { await this.save(job); return; }
@@ -1579,7 +1635,7 @@ export class Bridge {
       } catch (error) {
         const source = error.cliError || (error.code === 'media_download_too_large'
           ? {code:error.code, message:'Downloaded media exceeds the bridge size limit'} : {});
-        if (identityRecoveryCodes.has(source.code)) {
+        if (requiresIdentityRecovery(source)) {
           await this.holdForContext(job, error);
           return;
         }
@@ -1683,7 +1739,7 @@ export class Bridge {
     if (upstream.code === 'cli.download_too_large') message = 'cli.download_too_large：视频已生成，但文件超过即梦 CLI 下载大小限制，无法交付';
     if (upstream.code === 'media_download_too_large') message = 'media_download_too_large：视频已生成，但文件超过适配服务下载大小限制，无法交付';
     // Public error text is retained; known credentials are never echoed.
-    message = this.cleanMessage(message);
+    message = this.errorMessage(message, upstream);
     job.status = 'failed';
     job.completed_at = Math.floor(Date.now()/1000);
     delete job.attention;

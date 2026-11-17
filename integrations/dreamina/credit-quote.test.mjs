@@ -601,7 +601,7 @@ test('omitted run subject and unchanged generation terms keep the verified appro
   assert.equal(reply.billing.quote_status,'accepted');
 });
 
-test('official absence for the original disputed run ends it without resubmitting or billing', async t => {
+test('official absence for an accepted disputed run preserves review without resubmitting or settling', async t => {
   let unavailable = false;
   const f = await fixture(t, args => {
     if (args[1] === 'run') return {items:[{
@@ -624,14 +624,21 @@ test('official absence for the original disputed run ends it without resubmittin
   assert.equal(f.bridge.get(created.id).recovery.action,'manual_review');
   unavailable = true; job.diagnostics.next_poll_at_ms = 0; await f.bridge.tick();
   const final = f.bridge.get(created.id);
-  assert.equal(final.status,'failed');
+  assert.equal(final.status,'in_progress');
   assert.equal(job.runConflict,'run_generation_changed');
-  assert.equal(final.error.upstream_code,'cli.operation_submission_absent');
-  assert.match(final.error.message,/提交记录不存在或已过期/);
+  assert.equal(final.error,undefined);
+  assert.equal(final.diagnostics.last_error.code,'cli.operation_submission_absent');
+  assert.equal(final.recovery.action,'manual_review');
   assert.match(final.recovery.message,/生成参数已变化/);
   assert.equal(final.recovery.automatic_resubmit,false);
   assert.equal(final.billing.credits,undefined);
   assert.equal(final.video_count,0);
+  assert.ok(final.diagnostics.next_poll_at_ms>Date.now()+50000);
+  const source=await buildCreditPlugin({models:['seedance_2.5']});
+  const billingPlugin=await import('data:text/javascript;base64,'+Buffer.from(source).toString('base64'));
+  const receipt=billingPlugin.parseSubmitResponse({model:request.model,publicTaskId:key,requestBody:request},{body:created});
+  const parsed=billingPlugin.parseTaskResult({publicTaskId:key,taskId:created.id,state:receipt.state},final,{status:200});
+  assert.equal(parsed.status,'IN_PROGRESS');
   await f.bridge.tick();
   assert.deepEqual(f.calls.filter(a=>a[0]==='operation').map(a=>a[2]),[job.submitId,job.submitId]);
   assert.equal(f.calls.filter(a=>a[1]==='run').length,1);
