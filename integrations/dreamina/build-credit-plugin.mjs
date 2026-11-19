@@ -1,6 +1,7 @@
 import {readFile,writeFile} from 'node:fs/promises';
 import {fileURLToPath} from 'node:url';
 import {resolve} from 'node:path';
+import {IMAGE_MODELS} from './image-models.js';
 import {VIDEO_MODELS,PROMOTION_UNSUPPORTED} from './plugin.js';
 
 // Keep sale/procurement prices in the host, outside the generated plugin.
@@ -8,7 +9,7 @@ export async function buildCreditPlugin(config) {
  const models=config?.models, promotion=config?.promotionReservationCreditsPerVideo;
  if(!config || Object.keys(config).some(k=>!['models','promotionReservationCreditsPerVideo'].includes(k)) ||
     !Array.isArray(models) || !models.length || new Set(models).size!==models.length ||
-    models.some(model=>!Object.hasOwn(VIDEO_MODELS,model)))throw Error('Configure models with unique canonical video model names; legacy reservationCreditsPerVideo must be replaced');
+    models.some(model=>!Object.hasOwn(VIDEO_MODELS,model) && !Object.hasOwn(IMAGE_MODELS,model)))throw Error('Configure models with unique canonical model names; legacy reservationCreditsPerVideo must be replaced');
  // Accept an obsolete null setting, but never allow it to re-enable creation.
  if(promotion!==undefined && promotion!==null)throw Error(PROMOTION_UNSUPPORTED);
  let source=await readFile(new URL('./plugin.js',import.meta.url),'utf8');
@@ -17,7 +18,8 @@ export async function buildCreditPlugin(config) {
   if(source.split(declaration).length!==2)throw Error('Shared plugin hook contract changed: '+name);
   source=source.replace(declaration,'function seconds_'+name+'(');
  }
- return source+'\n// Generated credit variant; rebuild with build-credit-plugin.mjs.\nconst CREDIT_MODELS='+JSON.stringify(models)+';\n'+await readFile(new URL('./credit-hooks.js',import.meta.url),'utf8');
+ const images=await readFile(new URL('./image-models.js',import.meta.url),'utf8');
+ return source+'\n'+images+'\n// Generated credit variant; rebuild with build-credit-plugin.mjs.\nconst CREDIT_MODELS='+JSON.stringify(models)+';\n'+await readFile(new URL('./credit-hooks.js',import.meta.url),'utf8');
 }
 if(process.argv[1] && resolve(process.argv[1])===fileURLToPath(import.meta.url)) {
  const [configPath,outputPath]=process.argv.slice(2);

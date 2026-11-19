@@ -201,3 +201,15 @@ test('adding a model preserves historical tasks, idempotency and canvas ownershi
  }
  await assert.rejects(Bridge.open({...expanded,userId:'456'},cli),/owned by database storage/);
 });
+
+test('eight-image jobs preserve batch size and recovery identity after restart',async t=>{
+ const {store,context,url}=await fixture(t);
+ await store.initialize([],null);
+ const batch=job(context,'image-batch');
+ batch.request={model:'seedream_4.7',kind:'image',n:8};
+ await store.save(batch);
+ await store.close();
+ const recovered=await DatabaseStore.open({url,context});t.after(()=>recovered.close());
+ assert.deepEqual(await recovered.get(batch.id),batch);
+ assert.deepEqual(await recovered.active(),[batch]);
+});

@@ -1,10 +1,97 @@
 // Appended to the shared, self-contained protocol by build-credit-plugin.mjs.
-meta.version='1.5.1';
+meta.version='1.6.0';
 meta.models=CREDIT_MODELS.concat(CREDIT_MODELS.includes('seedance_2.5')?['dreamina-video']:[]);
 meta.usageSchema={
  credits:{type:'number',unit:'credit',description:{en:'Dreamina credit unit price',zh:'即梦积分单价'}},
  resolution:{enum:['480p','720p','1080p','4k'],description:{en:'Output video resolution',zh:'输出视频分辨率'}},
 };
+
+const imageModels = CREDIT_MODELS.filter(model=>has(IMAGE_MODELS,model));
+if (imageModels.length) {
+  const videos = meta.models.filter(model=>!has(IMAGE_MODELS,model));
+  meta.name='Dreamina CLI';
+  meta.description={en:'Image and video generation through the official Dreamina Canvas CLI',zh:'通过官方即梦画布 CLI 生成图片和视频'};
+  meta.protocols = [...(videos.length?[{name:'openai_video',models:videos}]:[]),{name:'openai_image',models:imageModels}];
+  meta.usageProfiles=[{models:imageModels,schema:{
+    credits:meta.usageSchema.credits,
+    resolution:{enum:['1k','1.5k','2k','4k'],description:{en:'Output image resolution',zh:'输出图片分辨率'}},
+  }}];
+  protocols.openai_image={decodeRequest:decodeImage,render:(_ctx,task)=>({data:task.data.data.map(entry=>({url:entry.url}))})};
+}
+
+// The CLI takes a resolution tier and aspect ratio, never arbitrary pixels.
+const imageSizes = {
+  '1024x1024':['1K','1:1'], '1536x1536':['1.5K','1:1'], '2048x2048':['2K','1:1'], '4096x4096':['4K','1:1'],
+  '1536x1024':['1.5K','3:2'], '1024x1536':['1.5K','2:3'],
+  '2496x1664':['2K','3:2'], '1664x2496':['2K','2:3'], '2304x1728':['2K','4:3'], '1728x2304':['2K','3:4'],
+  '2560x1440':['2K','16:9'], '1440x2560':['2K','9:16'], '2848x1600':['2K','16:9'], '1600x2848':['2K','9:16'],
+  '3840x2160':['4K','16:9'], '2160x3840':['4K','9:16'],
+};
+
+function decodeImage(ctx) {
+  const body=ctx.body || {};
+  let raw, uploads=[];
+  if (body.kind==='json' && object(body.value)) raw={...body.value};
+  else if (body.kind==='multipart') {
+    raw={};
+    for (const [key,values] of Object.entries(body.fields||{})) {
+      if (!Array.isArray(values) || values.length!==1) throw Error('Repeated field: '+key);
+      raw[key]=values[0];
+    }
+    const files=body.files||[];
+    const fields=new Set(files.map(f=>f.field));
+    let ordered=files;
+    if (files.length && !(fields.size===1 && (fields.has('image') || fields.has('image[]')))) {
+      const indexed=files.map(file=>{
+        const match=/^image\[(\d+)\]$/.exec(file.field);
+        if (!match || !Number.isSafeInteger(Number(match[1]))) throw Error('Expected consistently numbered image uploads');
+        return {index:Number(match[1]),file};
+      });
+      if (new Set(indexed.map(item=>item.index)).size!==indexed.length) throw Error('Duplicate image upload index');
+      ordered=indexed.sort((a,b)=>a.index-b.index).map(item=>item.file);
+    }
+    let bytes=0;
+    for (const f of ordered) {
+      if (!String(f.mimeType).startsWith('image/')) throw Error('Expected an image upload');
+      bytes+=bounded(f.size,undefined,1,MAX_INPUT_BYTES,'file size');
+      if (bytes>MAX_INPUT_BYTES) throw Error('Total reference files exceed 64 MiB');
+      uploads.push({__fileRef:f.ref,encoding:'dataUrl',mimeType:f.mimeType,maxBytes:MAX_INPUT_BYTES});
+    }
+  } else throw Error('JSON or multipart body required');
+  const {image,response_format,size,stream,...req}=raw;
+  if (stream!==undefined && stream!==false && !(body.kind==='multipart' && stream==='false')) throw Error('Image streaming is not supported');
+  if (size!==undefined && size!=='auto') {
+    if (typeof size!=='string') throw Error('Invalid image size');
+    const pair=imageSizes[size.toLowerCase()];
+    const tier=/^(1k|1\.5k|2k|4k)$/i.test(size)?size.toUpperCase():undefined;
+    if (!tier && !has(imageSizes,size.toLowerCase())) throw Error('Unsupported image size; use resolution and ratio');
+    const resolution=tier || pair[0];
+    if (req.resolution!==undefined && (typeof req.resolution!=='string' || req.resolution.toUpperCase()!==resolution)) throw Error('size conflicts with resolution');
+    req.resolution=resolution;
+    if (!tier) {
+      if (req.ratio!==undefined && req.ratio!==pair[1]) throw Error('size conflicts with ratio');
+      req.ratio=pair[1];
+    }
+  }
+  if (response_format!==undefined && !['url','b64_json'].includes(response_format)) throw Error('Unsupported response_format');
+  if ((image!==undefined && (uploads.length || req.references!==undefined)) || (uploads.length && req.references!==undefined)) throw Error('Conflicting reference image inputs');
+  if (image!==undefined) {
+    const urls=Array.isArray(image)?image:[image];
+    if (urls.some(url=>typeof url!=='string')) throw Error('Expected reference image URLs');
+    req.references=urls.map(url=>({type:'image',url}));
+  }
+  if (uploads.length) req.references=uploads.map(url=>({type:'image',url}));
+  const normalized=normalizeImage(req,ctx.upstreamModel||ctx.model,uploads.length>0);
+  if (ctx.operation !== (normalized.mode==='i2i'?'edit':'generate')) throw Error('Use the edits endpoint with reference images and generations without them');
+  return {kind:'submit',model:ctx.model,action:normalized.mode,requestBody:normalized};
+}
+function creditOutbound(ctx) {
+  const model=ctx.upstreamModel||ctx.model;
+  return has(IMAGE_MODELS,model)?normalizeImage(ctx.requestBody,model,true):outbound(ctx);
+}
+function deliveredCount(body) {
+  return body.object==='image'?body.image_count:body.video_count;
+}
 
 // Measured with Canvas CLI 1.2.0 on 2026-11-05 (2,289 quote-only cases).
 // Flash added from the 2026-11-13 survey (184 quote-only cases, CLI 1.2.0).
@@ -27,9 +114,9 @@ const REFERENCE_VIDEO_SECONDS = {
  'seedance_2.0_vip':15.4, 'seedance_2.0_fast_vip':15.4,
  'seedance_2.0_mini':15.4, 'wan_3.0':15,
 };
-function reservation(ctx) {
- const r=outbound(ctx);
+function reservation(ctx,r=creditOutbound(ctx)) {
  if(!CREDIT_MODELS.includes(r.model))throw Error('Credit estimation is not configured for this model');
+ if (r.kind==='image') return {version:2,request_id:ctx.publicTaskId,reserved_credits:IMAGE_MODELS[r.model].rates[r.resolution]*r.n};
  const video=r.references.some(ref=>ref.type==='video');
  const rates=CREDIT_RATES[r.model][r.resolution.toLowerCase()];
  // extractUsage cannot fetch or inspect uploaded media. Reserve the maximum
@@ -45,11 +132,12 @@ export function extractUsage(ctx) {
   if (ctx.usagePurpose === 'billing_ratios') {
     throw Error('Configure a credit billing expression for this Dreamina model');
   }
-  return {credits: reservation(ctx).reserved_credits, resolution: outbound(ctx).resolution.toLowerCase()};
+  const r=creditOutbound(ctx);
+  return {credits:reservation(ctx,r).reserved_credits,resolution:r.resolution.toLowerCase()};
 }
 export function buildSubmitRequest(ctx) {
- const result=seconds_buildSubmitRequest(ctx);
- result.headers['X-Dreamina-Billing']=JSON.stringify(reservation(ctx));
+ const r=creditOutbound(ctx), result=bridgeSubmit(ctx,r);
+ result.headers['X-Dreamina-Billing']=JSON.stringify(reservation(ctx,r));
  result.headers['X-Dreamina-Receipt']='header-v1';
  return result;
 }
@@ -86,12 +174,12 @@ export function parseSubmitResponse(ctx, response) {
   const result = seconds_parseSubmitResponse(ctx, {...response,body});
   const {billing: privateReceipt, ...publicData}=result.taskData;
   result.taskData=publicData;
-  const request = outbound(ctx);
-  const expected = reservation(ctx);
+  const request = creditOutbound(ctx);
+  const expected = reservation(ctx,request);
   result.state = {
     ...(result.state || {}),
     billingReceipt:privateReceipt,
-    billing: {...expected, job_id: result.taskId, model: request.model, seconds: request.seconds,
+    billing: {...expected, job_id: result.taskId, model: request.model, ...(request.kind==='video'?{seconds:request.seconds}:{}),
       n: request.n, mode: request.mode, resolution: request.resolution, ratio: request.ratio},
   };
   const stored = {taskId: result.taskId, publicTaskId: ctx.publicTaskId, state: result.state};
@@ -106,9 +194,10 @@ export function parseSubmitResponse(ctx, response) {
 function receiptUnit(ctx, body) {
   const previous = ctx.data;
   const frozen = ctx.state && ctx.state.billing;
-  const keys = ['model', 'seconds', 'n', 'mode', 'resolution', 'ratio'];
+  const keys = ['model','n','mode','resolution','ratio'];
+  if (body?.object !== 'image') keys.push('seconds');
 
-  if (!object(body) || body.object !== 'video' || !ctx.taskId || body.id !== ctx.taskId) {
+  if (!object(body) || body.object !== (frozen && has(IMAGE_MODELS,frozen.model) ? 'image' : 'video') || !ctx.taskId || body.id !== ctx.taskId) {
     throw Error('Credit billing task identity mismatch; original generation retained for review');
   }
 
@@ -193,8 +282,12 @@ function completionUsage(ctx, body, evidence) {
       (evidence.unit === 'credits' && (body.delivery_verified !== true || body.terminal_proof !== true))) {
     throw Error('Original operation or media delivery is not verified; original generation retained for review');
   }
-  const delivered = body.video_count;
-  if (!Number.isSafeInteger(body.n) || body.n < 1 || body.n > 4 ||
+  const delivered = deliveredCount(body);
+  const image = body.object === 'image';
+  if (image && (!Array.isArray(body.data) || body.data.length!==delivered ||
+      body.data.some(entry=>!entry || typeof entry.url!=='string' || !/^https?:\/\//.test(entry.url)) ||
+      new Set(body.data.map(entry=>entry.url)).size!==delivered)) throw Error('Image delivery receipt mismatch');
+  if (!Number.isSafeInteger(body.n) || body.n < 1 || body.n > (image ? IMAGE_MODELS[body.model].max : 4) ||
       !Number.isSafeInteger(delivered) || delivered < 1 || delivered > body.n) {
     throw Error('Invalid or empty batch delivery count; original generation retained for review');
   }
@@ -221,8 +314,8 @@ export function parseTaskResult(ctx, body, response) {
     if (result.status === 'UNKNOWN') return {status:'UNKNOWN', reason:'即梦任务回执待核查：' + result.reason};
     if (result.status === 'FAILURE' && body.status !== 'failed') throw Error(result.reason);
     if (result.status === 'FAILURE') {
-      if ((unit === 'credits' || has(body, 'video_count')) && body.video_count !== 0) {
-        throw Error('Failure receipt does not prove zero delivered videos; original generation retained for review');
+      if ((unit === 'credits' || has(body, 'video_count')) && (deliveredCount(body) !== 0 || body.object==='image' && (!Array.isArray(body.data) || body.data.length!==0))) {
+        throw Error('Failure receipt does not prove zero delivered outputs; original generation retained for review');
       }
       // A bound, zero-delivery failure needs no price to return the hold.
       // Explicit quote fields must still agree with the original acceptance:
@@ -235,7 +328,7 @@ export function parseTaskResult(ctx, body, response) {
     // A bound expired artifact cannot be newly delivered, but expiry is not
     // permission to refund a contradictory original quotation.
     if (result.status === 'SUCCESS' && body.content_expired === true) {
-      return {status:'FAILURE', reason:'视频已超过保留期限，无法交付，预扣将退回'};
+      return {status:'FAILURE', reason:body.object==='image'?'图片已超过保留期限，无法交付，预扣将退回':'视频已超过保留期限，无法交付，预扣将退回'};
     }
     const current = result.state || ctx.state;
     const next = observeQuoteState(current, evidence);
@@ -244,7 +337,7 @@ export function parseTaskResult(ctx, body, response) {
     if (result.status === 'SUCCESS') {
       const usage = completionUsage(ctx, body, evidence);
       if (unit === 'credits') {
-        result.state = {...result.state, settledCredits:usage.credits, deliveredCount:body.video_count};
+        result.state = {...result.state, settledCredits:usage.credits, deliveredCount:deliveredCount(body)};
       }
     }
     return result;

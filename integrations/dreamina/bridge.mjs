@@ -4,6 +4,7 @@ import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from
 import { mkdir, open, readFile, opendir, rename, unlink, lstat } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { isDeepStrictEqual } from 'node:util';
+import { IMAGE_MODELS, normalizeImage } from './image-models.js';
 import { VIDEO_MODELS, normalizeVideo, PROMOTION_UNSUPPORTED, formatUpstreamError } from './plugin.js';
 import {validateOSSConfig} from './oss-storage.mjs';
 import { Readable } from 'node:stream';
@@ -89,7 +90,10 @@ function observeOutputResources(job, resources) {
   return true;
 }
 
-function videoDraftState(shown, job, request) {
+function namedModel(model) {
+  return Object.hasOwn(VIDEO_MODELS,model) || Object.hasOwn(IMAGE_MODELS,model);
+}
+function draftState(shown, job, request) {
   if (!Array.isArray(shown?.nodes)) return 'unavailable';
   if (!shown.nodes.length) return 'missing'; // Legacy CLI empty lookup.
   if (shown.nodes.length !== 1 || shown.nodes[0]?.nodeId !== job.nodeId) return 'unavailable';
@@ -100,10 +104,10 @@ function videoDraftState(shown, job, request) {
   if (node?.nodeId !== job.nodeId || !node.generation || typeof node.generation !== 'object' || Array.isArray(node.generation)) return 'unavailable';
   const g=node?.generation,r=request,refs=g?.references??[];
   if (!['model','mode','prompt','ratio','resolution'].every(key=>typeof g[key]==='string') ||
-      !Number.isFinite(g.durationSeconds) || !integer(g.outputCount,1,Number.MAX_SAFE_INTEGER) ||
+      (r.kind !== 'image' && !Number.isFinite(g.durationSeconds)) || !integer(g.outputCount,1,Number.MAX_SAFE_INTEGER) ||
       !Array.isArray(refs) || !refs.every(ref=>ref && typeof ref.id==='string')) return 'unavailable';
   return g.model===r.model && g.mode===r.mode && g.prompt===r.prompt &&
-    g.ratio===r.ratio && g.resolution===r.resolution && g.durationSeconds===r.seconds && g.outputCount===r.n &&
+    g.ratio===r.ratio && g.resolution===r.resolution && (r.kind === 'image' || g.durationSeconds===r.seconds) && g.outputCount===r.n &&
     isDeepStrictEqual(refs.map(ref=>ref.id),(job.inputs||[]).map(input=>input.resourceId)) ? 'matching' : 'changed';
 }
 function equal(a, b) {
@@ -140,13 +144,13 @@ export function validateConfig(input) {
   }
   if (!c.models || Array.isArray(c.models) || !Object.keys(c.models).length) fail('config models are required');
   if (c.additionalModels !== undefined && (!c.additionalModels || typeof c.additionalModels !== 'object' ||
-      Array.isArray(c.additionalModels) || Object.keys(c.additionalModels).some(alias => Object.hasOwn(c.models, alias) || !Object.hasOwn(VIDEO_MODELS, alias)))) {
-    fail('invalid additional models: only new named video models may be appended');
+      Array.isArray(c.additionalModels) || Object.keys(c.additionalModels).some(alias => Object.hasOwn(c.models, alias) || !namedModel(alias)))) {
+    fail('invalid additional models: only new named models may be appended');
   }
   for (const [alias, m] of Object.entries({...c.models, ...c.additionalModels})) {
     if (!m || typeof m !== 'object' || Array.isArray(m)) fail('invalid config model: ' + alias);
-    if (Object.hasOwn(VIDEO_MODELS, alias)) {
-      if (m.kind !== 'video' || m.model !== alias || !integer(m.maxCredits, 0, 100000)) fail('invalid config model: ' + alias);
+    if (namedModel(alias)) {
+      if (m.kind !== (Object.hasOwn(IMAGE_MODELS,alias)?'image':'video') || m.model !== alias || !integer(m.maxCredits, 0, 100000)) fail('invalid config model: ' + alias);
       continue;
     }
     if (!['dreamina-image', 'dreamina-video'].includes(alias) || m.kind !== alias.slice(9) || !/^[A-Za-z0-9_.-]{1,160}$/.test(m.model || '') ||
@@ -373,14 +377,14 @@ export class Bridge {
     this.activePreparations = 0; this.preparationWaiters = []; this.readInput = readReference;
     this.lastQueuedId = null; this.lastPolledId = null; this.lastDownloadedId = null;
     this.nextPoll = new Map(); this.nextDownload = new Map();
-    this.catalogCheckedAt = null; this.catalogRefresh = null; this.contextCheck = null;
+    this.catalogCheckedAt = new Map(); this.catalogRefresh = new Map(); this.contextCheck = null;
     this.inFlight = new Map();
     this.verifiedMedia = new WeakMap();
     this.receiptChecks = new Map();
     this.promptLimits = new Map();
     this.activeUploads = 0;
     this.uploadWaiters = [];
-    this.videoCatalog = new Map();
+    this.catalogs = {video:new Map(),image:new Map()};
     this.leases = new Map(); // Deliberately not restored after downtime.
     this.gatewayLeases = new Map(); this.gatewayBlocks = new Set(); this.dispatchChecks = new Set();
     this.gatewayTaskReader = null; this.gatewayConfirmation = null;
@@ -474,17 +478,18 @@ export class Bridge {
     } finally { this.dispatchChecks.delete(job.id); }
   }
 
-  async refreshVideoCatalog() {
-    if (this.catalogCheckedAt !== null && Date.now() - this.catalogCheckedAt < this.config.catalogTTLms) return;
-    if (!this.catalogRefresh) {
-      this.catalogRefresh = (async () => {
-        const list = await this.cli(['model', 'list', '--type=video']);
+  async refreshCatalog(kind) {
+    if (Date.now() - (this.catalogCheckedAt.get(kind) || 0) < this.config.catalogTTLms) return;
+    if (!this.catalogRefresh.has(kind)) {
+      const refresh = (async () => {
+        const list = await this.cli(['model','list','--type='+kind]);
         if (!Array.isArray(list.items) || !list.items.length) fail('live model unavailable');
-        this.videoCatalog = new Map(list.items.map(m => [m.model, m]));
-        this.catalogCheckedAt = Date.now();
-      })().finally(() => { this.catalogRefresh = null; });
+        this.catalogs[kind] = new Map(list.items.map(model=>[model.model,model]));
+        this.catalogCheckedAt.set(kind,Date.now());
+      })().finally(()=>this.catalogRefresh.delete(kind));
+      this.catalogRefresh.set(kind,refresh);
     }
-    await this.catalogRefresh;
+    await this.catalogRefresh.get(kind);
   }
 
   recordTime(job, phase) {
@@ -501,9 +506,9 @@ export class Bridge {
       if (!catalogues.has(m.kind)) catalogues.set(m.kind, await this.cli(['model', 'list', '--type=' + m.kind]));
       const list = catalogues.get(m.kind);
       const model = list.items?.find(item => item.model === m.model);
-      if (Object.hasOwn(VIDEO_MODELS, alias)) {
+      if (namedModel(alias)) {
         if (!model?.modes?.length) fail('configured model unavailable: ' + alias, 503);
-        this.videoCatalog.set(alias, model);
+        this.catalogs[m.kind].set(alias, model);
         continue;
       }
       const mode = model?.modes?.find(item => item.name === (m.kind === 'image' ? 't2i' : 't2v'));
@@ -519,17 +524,17 @@ export class Bridge {
       if (!integer(max, 1, 100000)) fail('model prompt limit unavailable: ' + alias, 503);
       this.promptLimits.set(alias, Math.min(2000, max));
     }
-    if (catalogues.has('video')) this.catalogCheckedAt = Date.now();
+    for (const kind of catalogues.keys()) this.catalogCheckedAt.set(kind,Date.now());
   }
 
-  validateLiveVideo(request) {
-    const model = this.videoCatalog.get(request.model);
-    if (!model) fail('video model catalogue unavailable', 503);
+  validateLiveModel(request) {
+    const model = this.catalogs[request.kind].get(request.model);
+    if (!model) fail('model catalogue unavailable', 503);
     if (request.mode === 'promote') return; // Promotion has its own live spec.
     const matching = model.modes.filter(mode => mode.name === request.mode);
     const valid = matching.some(mode => {
       const flags = new Map((mode.flags || []).map(f => [f.flag, f]));
-      for (const [name, value] of [['ratio',request.ratio],['resolution',request.resolution],['duration',request.seconds],['count',request.n]]) {
+      for (const [name, value] of [['ratio',request.ratio],['resolution',request.resolution],...(request.kind==='video'?[['duration',request.seconds]]:[]),['count',request.n]]) {
         const spec = flags.get('--'+name);
         if (!spec || (spec.values ? !spec.values.includes(value) : !integer(value,spec.min,spec.max) || spec.step && (value-spec.min)%spec.step!==0)) return false;
       }
@@ -542,14 +547,14 @@ export class Bridge {
         const count=refs.filter(r=>r.type===type).length, rule=(caps.types||[]).find(t=>t.mediaType===type);
         if (rule ? count<rule.min || count>rule.max : count>0) return false;
       }
-      return !caps.requireAnyOfTypes || refs.some(r=>caps.requireAnyOfTypes.includes(r.type));
+      return !caps.requireAnyOfTypes?.length || refs.some(r=>caps.requireAnyOfTypes.includes(r.type));
     });
     if (!valid) fail('requested parameters are not available in the live CLI model specification');
   }
 
   validate(body, source = this.jobs.get(body?.source_job_id)) {
     if (!body || typeof body !== 'object' || Array.isArray(body)) fail('invalid request body');
-    if (Object.hasOwn(VIDEO_MODELS, body.model)) {
+    if (namedModel(body.model)) {
       if (!Object.hasOwn(this.config.models, body.model)) fail('unsupported model/kind');
       if (body.mode === 'promote') {
         if (Object.keys(body).some(k => !['kind','model','mode','source_job_id','resolution','ratio','seconds','n','references'].includes(k)) ||
@@ -558,8 +563,8 @@ export class Bridge {
         return {kind:'video',model:body.model,mode:'promote',source_job_id:source.id,resolution:'1080p',ratio:source.request.ratio,seconds:source.request.seconds,n:1,references:[]};
       }
       let r;
-      try { r = normalizeVideo(body, body.model, false); } catch(e) { fail(e.message); }
-      this.validateLiveVideo(r);
+      try { r = Object.hasOwn(IMAGE_MODELS,body.model) ? normalizeImage(body,body.model,false) : normalizeVideo(body,body.model,false); } catch(e) { fail(e.message); }
+      this.validateLiveModel(r);
       return r;
     }
     const m = Object.hasOwn(this.config.models, body.model) ? this.config.models[body.model] : undefined;
@@ -587,9 +592,10 @@ export class Bridge {
       const source = body?.mode==='promote' ? await this.loadJob(body.source_job_id) : undefined;
       const request = this.validate(body,source);
       if (typeof key !== 'string' || !/^[\x21-\x7e]{1,200}$/.test(key)) fail('invalid Idempotency-Key');
+      if (Object.hasOwn(IMAGE_MODELS,request.model) && billing?.version !== 2) fail('image generation requires a credit reservation');
       if (billing !== undefined) {
         if (!billing || Array.isArray(billing) || Object.keys(billing).some(k=>!['version','request_id','reserved_credits'].includes(k)) ||
-            ![1,2].includes(billing.version) || (billing.version===2 && request.mode==='promote') || billing.request_id!==key || !integer(billing.reserved_credits,1,1000000000) || !Object.hasOwn(VIDEO_MODELS,request.model)) fail('invalid gateway billing reservation');
+            ![1,2].includes(billing.version) || (billing.version===2 && request.mode==='promote') || billing.request_id!==key || !integer(billing.reserved_credits,1,1000000000) || !namedModel(request.model)) fail('invalid gateway billing reservation');
         billing={version:billing.version,request_id:key,reserved_credits:billing.reserved_credits};
       }
       const keyHash = hash(key), digest = hash(JSON.stringify(billing ? {request,billing} : request));
@@ -610,8 +616,8 @@ export class Bridge {
       if (activeUnits + this.preparingUnits + request.n > this.config.maxQueue) fail('Active video queue is full. Please retry after existing tasks finish.', 429, 'active_queue_full');
       const job = { id: randomUUID(), key: keyHash, digest, context: this.contextKey, request, ...(billing?{billing}:{}),
         ...(waitForGateway && /^task_[A-Za-z0-9_-]{1,160}$/.test(key) ? {gatewayTaskId:key} : {}),
-        ...(request.kind === 'video' && this.config.oss ? {outputStorage:{...this.config.oss,type:'oss',status:'pending'}} : {}),
-        ...(request.kind === 'video' ? {billingMode: billing ? 'credits' : 'legacy_seconds'} : {}),
+        ...((request.kind === 'video' || Object.hasOwn(IMAGE_MODELS,request.model)) && this.config.oss ? {outputStorage:{...this.config.oss,type:'oss',status:'pending'}} : {}),
+        ...(request.kind === 'video' || billing ? {billingMode: billing ? 'credits' : 'legacy_seconds'} : {}),
         nodeId: 'node_' + Array.from(randomBytes(10), b => '0123456789abcdefghjkmnpqrstvwxyz'[b & 31]).join(''), updateId: randomUUID(), submitId: randomUUID(),
         status: 'queued', created_at: Math.floor(Date.now() / 1000), timings: {admitted_at_ms: Date.now()}, files: [], inputs: [] };
       const reservation = {digest, units: request.n};
@@ -806,21 +812,21 @@ export class Bridge {
       ...(j.billingResolutionExpiresAt ? {billing_unresolved: !j.upstreamCreditQuote, billing_resolution_expires_at: j.billingResolutionExpiresAt} : {}),
       // Historical jobs have no mode field. A saved credit contract always wins;
       // new credit jobs retain their identity even if their contract is damaged.
-      ...(j.request.kind === 'video' ? {billing_mode: Object.hasOwn(j,'billing') ? 'credits' : j.billingMode ?? 'legacy_seconds'} : {}),
+      ...(j.request.kind === 'video' || hasCreditBilling(j) ? {billing_mode: Object.hasOwn(j,'billing') ? 'credits' : j.billingMode ?? 'legacy_seconds'} : {}),
       ...(billing ? {billing} : {}),
       ...mediaDeadlines(j),
-      ...(j.outputStorage?.status === 'ready' ? {storage:'oss',video_url:j.outputStorage.urls[0],video_urls:j.outputStorage.urls.slice(),download_url_expires_at:j.outputStorage.urlExpiresAt} : {}),
+      ...(j.outputStorage?.status === 'ready' ? {storage:'oss',...(j.request.kind==='video'?{video_url:j.outputStorage.urls[0],video_urls:j.outputStorage.urls.slice()}:{}),download_url_expires_at:j.outputStorage.urlExpiresAt} : {}),
       ...(mediaDeadlines(j).content_expires_at?{content_expired:Date.now()>=mediaDeadlines(j).content_expires_at*1000}:{}),
       n: j.request.n, mode:j.request.mode, ratio:j.request.ratio, resolution:j.request.resolution,
       video_count:j.request.kind === 'video' && j.status === 'completed' ? j.files.length : 0,
       reference_video:(j.request.references || []).some(r=>r.type==='video'),
       ...(j.request.model === 'seedance_2.5_draft' ? {warning:'样片最长存储 7 天，具体期限以即梦服务端为准；' + PROMOTION_UNSUPPORTED} : {}),
-      seconds: j.request.seconds, image_count: j.status === 'completed' ? j.files.length : j.request.n,
+      seconds: j.request.seconds, image_count: j.status === 'completed' ? j.files.length : j.request.kind==='image' && hasCreditBilling(j) ? 0 : j.request.n,
       timings: j.timings ? {...j.timings} : undefined,
       phase: terminal(j) ? j.status : j.outputStorage?.status === 'uploading' ? 'uploading' : j.attention ? 'needs_attention' : j.downloadResources ? 'downloading' : j.status,
       recovery: this.recovery(j), diagnostics: j.diagnostics ? structuredClone(j.diagnostics) : undefined,
       progress: j.status === 'completed' ? 100 : 0, attention: j.attention, error: j.error,
-      data: j.status === 'completed' && j.request.kind === 'image' ? j.files.map((f, i) => ({ url: this.mediaURL(j.id, i) })) : [] };
+      data: j.status === 'completed' && j.request.kind === 'image' ? j.files.map((f, i) => ({ url: j.outputStorage?.status==='ready'?j.outputStorage.urls[i]:this.mediaURL(j.id,i) })) : [] };
   }
 
   recovery(job) {
@@ -913,7 +919,26 @@ export class Bridge {
     // Legacy completions predate terminal receipts and checksums. Preserve
     // their original result without issuing new credit delivery evidence.
     if (!hasCreditBilling(job)) return this.get(id,job);
-    if (job.outputStorage?.status === 'ready') return {...this.get(id,job),delivery_verified:true};
+    const storage=job.outputStorage;
+    if (storage?.status === 'ready') {
+      const receipt=this.get(id,job);
+      if (job.request.kind==='image' && !(storage.urlExpiresAt>Math.floor(Date.now()/1000))) {
+        // Only renew the links handed to this poll. The completed operation,
+        // verified object keys and original video snapshots remain durable.
+        const expires=Math.floor(Date.now()/1000)+storage.signedUrlSeconds;
+        try {
+          const data=await Promise.all(job.files.map(async file=>({url:await this.oss.sign(file.oss,storage.signedUrlSeconds)})));
+          if (expires<=Math.floor(Date.now()/1000)) throw Error('Image links expired during signing');
+          return {...receipt,data,download_url_expires_at:expires,delivery_verified:true};
+        } catch {
+          // A temporary signing outage only delays delivery of the same job.
+          return {...receipt,status:'in_progress',phase:'signing',progress:0,completed_at:undefined,
+            recovery:{action:'retry_query',message:'正在重新签发图片下载链接',automatic_resubmit:false},
+            data:[],image_count:0,download_url_expires_at:undefined,delivery_verified:false};
+        }
+      }
+      return {...receipt,delivery_verified:true};
+    }
     const expires = mediaDeadlines(job).content_expires_at;
     if (expires && Date.now() >= expires * 1000) return {...this.get(id,job),delivery_verified:false};
     // Historical records without a submission identity remain downloadable,
@@ -1141,9 +1166,9 @@ export class Bridge {
     return encoded;
   }
 
-  async submitQuotedVideo(job) {
+  async submitQuotedGeneration(job) {
     const configured = this.config.models[job.request.model];
-    const r = Object.hasOwn(VIDEO_MODELS, job.request.model) ? job.request :
+    const r = namedModel(job.request.model) ? job.request :
       {...job.request, model: configured.model, mode: 't2v', ratio: configured.ratio, resolution: configured.resolution};
     const project='--project-id='+this.projectId(job), node='--node-id='+job.nodeId;
     const preexistingSavedDraft=job.draftSaved===true;
@@ -1154,7 +1179,7 @@ export class Bridge {
         let shown;
         try { shown=await this.cli(['node','show',project,node]); }
         catch(error){this.failed(job,'draft_save_unavailable',error.cliError);await this.save(job);return;}
-        const state=videoDraftState(shown,job,r);
+        const state=draftState(shown,job,r);
         if(state==='changed' || state==='unavailable') {
           this.failed(job,state==='changed'?'draft_changed':'draft_save_unavailable');await this.save(job);return;
         }
@@ -1164,9 +1189,9 @@ export class Bridge {
         job.draftSaveAttempted=true;
         await this.save(job);
         let saved;
-        try { saved=await this.cli(['node','create','video',project,node,'--update-id='+job.updateId,
+        try { saved=await this.cli(['node','create',r.kind,project,node,'--update-id='+job.updateId,
           '--mode='+r.mode,'--model='+r.model,'--prompt='+r.prompt,'--ratio='+r.ratio,'--resolution='+r.resolution,
-          '--count='+r.n,'--duration='+r.seconds,'--title=Video generation',...(job.inputs||[]).map(input=>'--ref=res:'+input.resourceId)]); }
+          '--count='+r.n,...(r.kind==='video'?['--duration='+r.seconds,'--title=Video generation']:['--title=Image generation']),...(job.inputs||[]).map(input=>'--ref=res:'+input.resourceId)]); }
         catch(error) {
           // A save has no generation side effect. Keep its identity for a
           // readback on the next leased attempt, bounded by the queue window.
@@ -1187,7 +1212,7 @@ export class Bridge {
       let shown;
       try {shown=await this.cli(['node','show',project,node]);}
       catch(error){this.failed(job,'draft_save_unavailable',error.cliError);await this.save(job);return;}
-      const state=videoDraftState(shown,job,r);
+      const state=draftState(shown,job,r);
       if(state!=='matching') {
         this.failed(job,state==='changed'?'draft_changed':'draft_save_unavailable');await this.save(job);return;
       }
@@ -1322,10 +1347,10 @@ export class Bridge {
       if (Date.now() >= (job.created_at+this.config.maxQueueWaitSeconds)*1000 || !this.dispatchAllowed(job)) {
         job.attention='awaiting_gateway';await this.save(job);return;
       }
-      if (Object.hasOwn(VIDEO_MODELS, job.request.model)) {
+      if (namedModel(job.request.model)) {
         try {
-          await this.refreshVideoCatalog();
-          this.validateLiveVideo(job.request);
+          await this.refreshCatalog(job.request.kind);
+          this.validateLiveModel(job.request);
           if (job.request.mode === 'promote') {
             const details = await this.cli(['model','seedance_2.5_draft']);
             const generation = details.matches?.map(m=>m.generation).find(g=>g?.generationKind==='sample' && g.mode===source.request.mode);
@@ -1345,7 +1370,7 @@ export class Bridge {
         }
       }
       if (this.closed) return;
-      if (job.request.kind === 'video' && job.request.mode !== 'promote') return this.submitQuotedVideo(job);
+      if ((job.request.kind === 'video' || Object.hasOwn(IMAGE_MODELS,job.request.model)) && job.request.mode !== 'promote') return this.submitQuotedGeneration(job);
       // Promotion itself has no read-only quote API. Verify the original node's
       // consumption subject on its own canvas; its price does not price promotion.
       const project = this.projectId(job);
@@ -1686,7 +1711,9 @@ export class Bridge {
         if (!this.oss) throw Error('OSS unavailable');
         const date=new Date(job.created_at*1000).toISOString().slice(0,10).replaceAll('-','/');
         const taskId=/^task_[A-Za-z0-9_-]{1,160}$/.test(job.gatewayTaskId || '') ? job.gatewayTaskId : job.id;
-        const key=storage.prefix+'/'+date+'/'+taskId+'/outputs/'+String(index+1).padStart(3,'0')+'.mp4';
+        const suffix=job.request.kind==='image'?{'image/png':'png','image/jpeg':'jpg','image/webp':'webp'}[file.mime]:'mp4';
+        if (!suffix) throw Error('Unsupported output format');
+        const key=storage.prefix+'/'+date+'/'+taskId+'/outputs/'+String(index+1).padStart(3,'0')+'.'+suffix;
         saved=await this.oss.upload(file,join(this.config.dataDir,file.filename),storage,key);
       } catch {
         // SDK errors can contain credentials/URLs. Expose only a fixed message.

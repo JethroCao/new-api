@@ -4,7 +4,7 @@ This integration targets official commit `9c2c370a6156b3ac41874231952a938891ac54
 
 ## Components and installation
 
-- `dist/dreamina-cli.js`: uploadable API v1 credit-billing plugin, key `dreamina-cli`, version `1.4.0`. Install through the official task-plugin management API or UI and select it on the bridge channel.
+- `dist/dreamina-cli.js`: uploadable API v1 credit-billing plugin, key `dreamina-cli`, version `1.6.0`. Install through the official task-plugin management API or UI and select it on the bridge channel.
 - `plugin.js`: shared protocol/legacy seconds implementation used by the generator. **Do not upload this source as the credit-billing release.**
 - `bridge.mjs` / `server.mjs`: independent Node.js service running the Canvas CLI; A and B each use their own profile, account/team binding, database context and media directory.
 - `standard-credit-pricing.json`: explicit normal-group price configuration, not host defaults. Its historical 70% benchmark is dated 2026-10-29; it is not a newly checked official price list. Kemeng pricing is outside this configuration.
@@ -31,6 +31,16 @@ node standard-credit-pricing.mjs /tmp/dreamina-pricing-patch.json --snapshot /pa
 
 The generated patch preserves unrelated providers and uses the official optimistic version check. Existing administrator prices require an explicit replacement choice. It does not submit the patch. The existing site money convention must match the declared CNY 1:1, 500000 quota/CNY and group ratio 1 assumptions.
 
+## Images
+
+The same `dreamina-cli` plugin serves `POST /v1/images/generations` for text prompts and `POST /v1/images/edits` for reference images. For example, submit `{"model":"seedream_5.5","prompt":"A paper boat","resolution":"2K","ratio":"1:1","n":2}`. For edits, add an `image` HTTPS URL, a Base64 image data URL, or an array of these. Multipart edits accept repeated `image` or `image[]` fields in upload order, or numbered fields such as `image[0]` and `image[1]` in numeric order. Use one style per request and a unique index for each numbered file. The request waits for completion and returns images in `data[].url`. Private bridge deployments should configure OSS so clients can fetch the results. Local delivery uses signed URLs on the configured `publicUrl` and requires that address to be reachable by the client.
+
+The image models in `config.example.json` go under `additionalModels` when extending existing bridges. Preserve the original `models` object, which is part of the storage identity. Select the image models on the channel and configure the per-credit sale price for each image model in New API. The plugin reserves the surveyed credits per image times the requested count. It settles the accepted batch quote in proportion to verified outputs. Each new request can generate up to four images. V8.2 requires exactly four. Requests and reference limits are checked against the bridge's live model catalogue.
+
+Image requests accept `stream: false` and a `size` alias. Use `auto` for the model default, a supported tier such as `2K`, or a pixel preset such as `2048x2048` (2K, 1:1) or `1536x1024` (1.5K, 3:2). Pixel presets select the CLI tier and aspect ratio. The model must support both. Conflicting size, resolution or ratio fields are rejected before generation.
+
+For private OSS images, the bridge renews an expired signature for the original object before reporting delivery. A signing outage leaves the image awaiting delivery and the next poll retries signing.
+
 ## Startup dispatch
 
 Input preparation for different requests uses `inputPreparationWorkers` (default 4, range 1–4). Each request downloads up to three references at a time while preserving their order. Downloads share the request's media byte limit and a 60-second deadline that starts when preparation begins. A failure cancels the other downloads in the request. Capacity is reserved before preparation, repeated identical keys share the same preparation, and conflicting bodies are rejected. Requests without references do not wait for a preparation slot. The short admission lock protects idempotency, capacity and canvas allocation.
@@ -41,9 +51,9 @@ The bridge reads only its queued task IDs in one indexed batch (up to 200) each 
 
 This is a read of official task persistence, not a receipt of completed billing: the unchanged host still inserts before its initial billing settlement. It reduces the orphan-submission window without providing an atomic transaction with the upstream. The reader depends on the official task schema and must be revalidated when upgrading New API. New `gatewayTaskId` and preparation/confirmation timings live only in bridge records. Legacy queued credit jobs use their existing private `billing.request_id`; older jobs without a public ID use normal polling. Plugin release and billing expressions do not change for this optimization.
 
-## Optional private OSS video delivery
+## Optional private OSS delivery
 
-OSS is opt-in and affects only new video admissions. Existing jobs keep their original local delivery and retention; no backfill or official schema changes are performed. Add this configuration to the bridge operator's JSON on each CLI machine:
+OSS is opt-in for new video and named image admissions. Existing jobs keep their original local delivery and retention; no backfill or official schema changes are performed. Add this configuration to the bridge operator's JSON on each CLI machine:
 
 ```json
 {
@@ -60,7 +70,7 @@ OSS is opt-in and affects only new video admissions. Existing jobs keep their or
 
 Provide `DREAMINA_OSS_ACCESS_KEY_ID` and `DREAMINA_OSS_ACCESS_KEY_SECRET` through the protected service environment, never the JSON config, plugin source or request body. Use a private Standard-storage bucket. The uploader uses OSS V4 signatures and a private object ACL; the existing RAM object permissions (`oss:PutObject`, `oss:GetObject`, `oss:DeleteObject` on this bucket only) suffice for the upload/read operations. No object listing or bucket management operation is performed. This integration never deletes OSS objects; the DeleteObject grant is not exercised. Ensure no existing bucket lifecycle rule expires this prefix if long-term retention is required. `internal: true` uses the Hangzhou internal endpoint for upload/verification; signed client URLs always use the public HTTPS endpoint. A laptop outside that VPC needs `internal: false` for a separately authorized live upload test. `--check` validates configuration/credentials locally, but does not upload an OSS test object or prove RAM permissions.
 
-Each job freezes its destination at admission. The existing adapter job JSON stores the output index and `files[].oss` (`bucket`, `region`, `key`, byte length, SHA-256 and upload time). Object keys are `prod/videos/YYYY/MM/DD/<public-task-id>/outputs/001.mp4` (UTC date; adapter job UUID is used when no public task ID exists). The adapter uploads only verified successful outputs, persists each upload checkpoint, then signs all URLs before reporting completion. SHA-256 metadata and length are checked with HEAD; Content-MD5 validates the PUT payload. A lost upload response is recovered with HEAD instead of uploading again. Upload failures remain in progress with `retry_upload`, use a separate bounded worker lane (default 2, allowed 1–4), and back off to 60 seconds without regenerating. The unchanged host's overall task timeout still applies; prolonged OSS outages must be handled operationally before that deadline.
+Each job freezes its destination at admission. The existing adapter job JSON stores the output index and `files[].oss` (`bucket`, `region`, `key`, byte length, SHA-256 and upload time). Object keys are `prod/videos/YYYY/MM/DD/<public-task-id>/outputs/001.mp4` (UTC date; adapter job UUID is used when no public task ID exists). Images use the same configured prefix, with a PNG, JPEG or WebP extension selected from the verified file bytes. The adapter uploads only verified successful outputs, persists each upload checkpoint, then signs all URLs before reporting completion. SHA-256 metadata and length are checked with HEAD; Content-MD5 validates the PUT payload. A lost upload response is recovered with HEAD instead of uploading again. Upload failures remain in progress with `retry_upload`, use a separate bounded worker lane (default 2, allowed 1–4), and back off to 60 seconds without regenerating. The unchanged host's overall task timeout still applies; prolonged OSS outages must be handled operationally before that deadline.
 
 `GET /v1/videos/{task_id}` adds these fields for successful OSS jobs:
 

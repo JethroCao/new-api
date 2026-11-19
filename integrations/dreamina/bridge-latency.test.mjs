@@ -104,12 +104,12 @@ test('catalogue refresh is shared, expires and never uses stale data after refre
   t.mock.timers.enable({apis:['Date'],now:100000});
   const {bridge,cli}=await fixture(t);let reads=0,broken=false;
   bridge.cli=async a=>{if(a[0]==='model' && a[1]==='list'){reads++;if(broken)throw Error('unavailable');}return cli(a);};
-  await Promise.all([bridge.refreshVideoCatalog(),bridge.refreshVideoCatalog()]);assert.equal(reads,0);
+  await Promise.all([bridge.refreshCatalog('video'),bridge.refreshCatalog('video')]);assert.equal(reads,0);
   t.mock.timers.tick(60001);
-  await Promise.all([bridge.refreshVideoCatalog(),bridge.refreshVideoCatalog()]);assert.equal(reads,1);
+  await Promise.all([bridge.refreshCatalog('video'),bridge.refreshCatalog('video')]);assert.equal(reads,1);
   t.mock.timers.tick(60001);broken=true;
-  await assert.rejects(bridge.refreshVideoCatalog(),/unavailable/);
-  await assert.rejects(bridge.refreshVideoCatalog(),/unavailable/);assert.equal(reads,3);
+  await assert.rejects(bridge.refreshCatalog('video'),/unavailable/);
+  await assert.rejects(bridge.refreshCatalog('video'),/unavailable/);assert.equal(reads,3);
 });
 
 test('context checks coalesce concurrent calls but recheck every subsequent workflow',async t=>{

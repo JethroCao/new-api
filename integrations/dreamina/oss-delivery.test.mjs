@@ -166,3 +166,47 @@ test('POST admission freezes destination, downloads once, then uploads before pu
  await bridge.tick();const completed=await(await fetch(url+'/'+ack.id,{headers})).json();
  assert.equal(completed.status,'completed');assert.equal(completed.video_urls.length,1);assert.equal(runs,1);assert.equal(downloads,1);assert.equal(uploads,1);
 });
+
+test('verified image signs its original media type and returns the public OSS URL in data',async t=>{
+ const {bridge,j,dir}=await fixture(t);
+ j.request={kind:'image',model:'seedream_4.7',resolution:'2K',ratio:'1:1',mode:'t2i',n:1};
+ j.billingMode='credits';
+ const bytes=Buffer.from('89504e470d0a1a0a00000000','hex');
+ const file=j.files[0];
+ Object.assign(file,{mime:'image/png',resourceId:'image',size:bytes.length,sha256:createHash('sha256').update(bytes).digest('hex')});
+ await writeFile(join(dir,file.filename),bytes);
+ const url='https://cdn.example.org/image.png?signature=test';
+ bridge.oss={
+  upload:async(f,path,dest,key)=>{
+   assert.equal(f.mime,'image/png');assert.match(key,/\/outputs\/001\.png$/);assert.deepEqual(await readFile(path),bytes);
+   return {key,size:f.size,sha256:f.sha256,bucket:dest.bucket,region:dest.region};
+  },
+  sign:async()=>url,
+ };
+ await bridge.uploadOutputs(j);
+ const receipt=await bridge.verifyDelivery(j);
+ assert.deepEqual(receipt.data,[{url}]);assert.equal(receipt.video_url,undefined);
+ assert.equal(receipt.image_count,1);assert.equal(receipt.delivery_verified,true);
+
+ // The input and local output need not still exist when the host first collects the result.
+ t.mock.timers.enable({apis:['Date'],now:(j.outputStorage.urlExpiresAt+1)*1000});
+ await bridge.cleanupMedia();
+ await assert.rejects(stat(join(dir,file.filename)),{code:'ENOENT'});
+ bridge.oss.sign=async()=>{throw Error('sensitive signing details');};
+ const pending=await bridge.observe(j.id,j);
+ assert.equal(pending.status,'in_progress');
+ assert.equal(pending.delivery_verified,false);
+ assert.deepEqual(pending.data,[]);
+ assert.equal(pending.image_count,0);
+ assert.doesNotMatch(JSON.stringify(pending),/signature=test|sensitive signing/);
+ let renewed=0;
+ bridge.oss.sign=async(object,ttl)=>{
+   renewed++;assert.equal(object.key,file.oss.key);assert.equal(ttl,j.outputStorage.signedUrlSeconds);
+   return 'https://cdn.example.org/image.png?signature=fresh';
+ };
+ const [fresh,concurrent]=await Promise.all([bridge.observe(j.id,j),bridge.observe(j.id,j)]);
+ assert.equal(renewed,1);assert.deepEqual(fresh,concurrent);
+ assert.equal(fresh.data[0].url,'https://cdn.example.org/image.png?signature=fresh');
+ assert.ok(fresh.download_url_expires_at>Math.floor(Date.now()/1000));
+ assert.equal(fresh.delivery_verified,true);assert.equal(fresh.status,'completed');
+});

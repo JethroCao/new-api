@@ -93,7 +93,7 @@ export class DatabaseStore {
   }
   validate(job) {
     if(job.context!==this.context || !UUID.test(job.id) || !HASH.test(job.key) || !HASH.test(job.digest) ||
-      !['queued','in_progress','completed','failed'].includes(job.status) || !Number.isSafeInteger(job.request?.n) || job.request.n<1 || job.request.n>4)throw storageError();
+      !['queued','in_progress','completed','failed'].includes(job.status) || !Number.isSafeInteger(job.request?.n) || job.request.n<1 || job.request.n>(job.request.kind==='image'?8:4))throw storageError();
   }
   async insert(job) {
     this.validate(job);

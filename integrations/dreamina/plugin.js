@@ -127,8 +127,11 @@ function outbound(ctx) {
 function base(ctx) { return ctx.baseUrl.replace(/\/+$/, ''); }
 function auth(ctx) { return { Authorization:'Bearer ' + ctx.apiKey }; }
 export function buildSubmitRequest(ctx) {
+  return bridgeSubmit(ctx,outbound(ctx));
+}
+function bridgeSubmit(ctx, body) {
   if (!ctx.publicTaskId) throw new Error('Gateway public task ID is required for idempotency');
-  return {url:base(ctx)+'/v1/jobs',method:'POST',headers:Object.assign(auth(ctx),{'Content-Type':'application/json','Idempotency-Key':ctx.publicTaskId}),body:outbound(ctx)};
+  return {url:base(ctx)+'/v1/jobs',method:'POST',headers:Object.assign(auth(ctx),{'Content-Type':'application/json','Idempotency-Key':ctx.publicTaskId}),body:body};
 }
 function upstreamCreditQuote(response, job) {
   const headers=response && response.headers || {};
@@ -214,14 +217,20 @@ export function extractUsageOnComplete(ctx,result,body) {
   return {seconds:bounded(body.seconds,undefined,4,30,'seconds')*bounded(body.video_count,undefined,1,4,'video_count')};
 }
 export function listArtifacts(task) {
-  if (task.status!=='SUCCESS' || !task.data || task.data.object!=='video') return [];
+  if (task.status!=='SUCCESS' || !task.data) return [];
+  if (task.data.object==='image') {
+    const count=bounded(task.data.image_count,undefined,1,8,'image_count');
+    return Array.from({length:count},(_,i)=>({key:i===0?'image':'image-'+(i+1),type:'image'}));
+  }
+  if (task.data.object!=='video') return [];
   const count=bounded(task.data.video_count,1,1,4,'video_count');
   return Array.from({length:count},(_,i)=>({key:i===0?'video':'video-'+(i+1),type:'video'}));
 }
 export function buildContentRequest(ctx) {
   const key=String(ctx.artifactKey||'');
-  const index=key==='video'?0:/^video-[2-4]$/.test(key)?Number(key.slice(6))-1:-1;
-  if (index<0 || index>=bounded(ctx.data && ctx.data.video_count,1,1,4,'video_count')) throw new Error('artifact_not_found');
+  const image=ctx.data?.object==='image', kind=image?'image':'video';
+  const index=key===kind?0:key.startsWith(kind+'-') && /^[2-8]$/.test(key.slice(6))?Number(key.slice(6))-1:-1;
+  if (index<0 || index>=bounded(ctx.data && ctx.data[kind+'_count'],1,1,image?8:4,kind+'_count')) throw new Error('artifact_not_found');
   return {url:base(ctx)+'/v1/jobs/'+encodeURIComponent(ctx.upstreamTaskId)+'/content/'+index,method:ctx.clientRequest.method,headers:auth(ctx)};
 }
 export const protocols={openai_video:{decodeRequest:decode,render:function(ctx,task){

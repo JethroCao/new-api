@@ -38,7 +38,7 @@ try {
     bridge.oss = oss;
     if (gatewayDatabaseUrl) bridge.gatewayTaskReader = await GatewayTaskReader.open({url:gatewayDatabaseUrl,channelId:config.gatewayChannelId});
     bridge.promptLimits = probe.promptLimits;
-    bridge.videoCatalog = probe.videoCatalog;
+    bridge.catalogs = probe.catalogs;
     bridge.catalogCheckedAt = probe.catalogCheckedAt;
     bridge.onEvent = event => console.log(JSON.stringify(event));
     server = createServer(bridge);

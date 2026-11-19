@@ -122,3 +122,14 @@ test('a failed registry write blocks further allocations until a safe reload',as
   assert.equal(state.canvases.filter(x=>!x.legacy).length,1);
   assert.equal(state.canvases.find(x=>!x.legacy).slots.length,5);
 });
+
+test('an indivisible eight-image batch owns an empty canvas and reuses it after restart',async t=>{
+ const {pool,options}=await fixture(t);
+ const first=await pool.reserve(identity(1));
+ const batch={...identity(2),request:{kind:'image',n:8}};
+ const own=await pool.reserve(batch);
+ assert.notEqual(own.projectId,first.projectId);
+ const reopened=await CanvasPool.open({...options,jobs:[{...batch,projectId:own.projectId}]});
+ assert.deepEqual(await reopened.reserve(batch),own);
+ assert.notEqual((await reopened.reserve(identity(3))).projectId,own.projectId);
+});

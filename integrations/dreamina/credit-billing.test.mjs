@@ -536,3 +536,144 @@ test('private receipt headers bind the current poll and supply completion facts 
  const mismatch={...done,billing:{...done.billing,request_id:'another-task'}};
  assert.equal(p.parseTaskResult(poll,publicBody(done),response(mismatch)).status,'UNKNOWN');
 });
+
+test('image models reserve surveyed credits on normalized generate and edit requests', async () => {
+ const p=await import('./dist/dreamina-cli.js');
+ const images=p.protocols.openai_image;
+ const decode=(model,value,operation='generate')=>images.decodeRequest({model,operation,body:{kind:'json',value}});
+ const tiers=[
+  ['high_aes_general_v50_flash',{'1.5K':3,'2K':3}],['jimeng_smart_image_v1',{'1K':6,'2K':11,'4K':14}],
+  ['jm_image_model_anycook',{'2K':1,'4K':2}],['jm_image_model_yc_mj82',{'1K':5,'2K':7}],
+  ['seedream_4.0',{'2K':1,'4K':2}],['seedream_4.1',{'2K':1,'4K':2}],['seedream_4.5',{'2K':3,'4K':4}],
+  ['seedream_4.6',{'2K':1,'4K':2}],['seedream_4.7',{'1K':1,'2K':1,'4K':2}],
+  ['seedream_5.0_lite',{'2K':3,'4K':4}],['seedream_5.0_pro',{'1.5K':5,'2K':8,'4K':12}],['seedream_5.5',{'1.5K':4,'2K':6}],
+ ];
+ for (const [model,rates] of tiers) {
+  const n=model==='jm_image_model_yc_mj82'?4:2;
+  for (const [resolution,unit] of Object.entries(rates)) for (const operation of ['generate','edit']) {
+   const req=decode(model,{prompt:'paper boat',n,resolution,...(operation==='edit'?{image:'https://example.org/img.png'}:{})},operation);
+   assert.deepEqual(p.extractUsage(req),{credits:n*unit,resolution:resolution.toLowerCase()});
+  }
+ }
+ const model='seedream_4.7', prompt='paper boat';
+ for (const body of [{n:0},{n:9},{n:1.5},{mode:'i2i'},{seconds:3},{metadata:{n:8}},{resolution:'8K'},
+  {image:'http://invalid'},{references:[{type:'image',url:{__fileRef:'request_file:image',encoding:'dataUrl'}}]}])
+  assert.throws(()=>decode(model,{prompt,...body}));
+ assert.throws(()=>decode(model,{prompt},'edit'));
+ assert.throws(()=>decode('jm_image_model_yc_mj82',{prompt,n:1}));
+ assert.equal(decode('jm_image_model_yc_mj82',{prompt}).requestBody.n,4);
+ const file={field:'image[]',size:9,mimeType:'image/png',ref:'request_file:image[]'};
+ const uploaded=images.decodeRequest({model,operation:'edit',body:{kind:'multipart',fields:{prompt:[prompt]},files:[file]}});
+ assert.equal(uploaded.requestBody.references[0].url.__fileRef,file.ref);
+ assert.throws(()=>images.decodeRequest({model,operation:'edit',body:{kind:'multipart',fields:{prompt:[prompt]},files:[{...file,field:'mask'}]}}));
+});
+
+test('image admissions cap batches at four on both sides of the HTTP boundary',async()=>{
+ const model='seedream_4.0', p=await load({models:[model]});
+ const bridge=new Bridge({models:{[model]:{kind:'image',model}}});
+ for (const mode of ['generate','edit']) for (const n of [5,'5',8]) {
+  const value={model,prompt:'boat',n,...(mode==='edit'?{image:'https://test.invalid/ref'}:{})};
+  assert.throws(()=>p.protocols.openai_image.decodeRequest({model,operation:mode,body:{kind:'json',value}}),/count/);
+  assert.throws(()=>bridge.validate({model,prompt:'boat',n,kind:'image'}),/count/);
+ }
+});
+
+test('image size and explicit non-streaming requests reserve the normalized model tier',async()=>{
+ const model='high_aes_general_v50_flash', p=await load({models:[model]});
+ const decode=value=>p.protocols.openai_image.decodeRequest({model,operation:'generate',body:{kind:'json',value:{prompt:'boat',...value}}});
+ for(const [size,resolution,ratio] of [['auto','1.5K','1:1'],['2k','2K','1:1'],['2048x2048','2K','1:1'],['1536x1024','1.5K','3:2'],['1024x1536','1.5K','2:3']]) {
+  const req=decode({size,stream:false});
+  assert.equal(req.requestBody.resolution,resolution);
+  assert.equal(req.requestBody.ratio,ratio);
+  assert.deepEqual(p.extractUsage(req),{credits:3,resolution:resolution.toLowerCase()});
+ }
+ for(const params of [{size:'1024x1024'},{size:'bogus'},{size:'2048x2048',ratio:'2:3'},
+   {size:'2048x2048',resolution:'1.5K'},{stream:true},{stream:'false'}]) assert.throws(()=>decode(params));
+});
+
+test('multipart image edits honor numeric indices and repeated-file order',async()=>{
+ const model='seedream_4.0',p=await load({models:[model]});
+ const file=(field,id)=>({field,ref:'request_file:'+id,size:9,mimeType:'image/png'});
+ const decode=files=>p.protocols.openai_image.decodeRequest({model,operation:'edit',body:{kind:'multipart',
+   fields:{prompt:['boat'],size:['2048x2048'],stream:['false']},files}}).requestBody;
+ const inputs=decode([file('image[10]','c'),file('image[2]','b'),file('image[0]','a')]);
+ assert.deepEqual(inputs.references.map(ref=>ref.url.__fileRef),['request_file:a','request_file:b','request_file:c']);
+ assert.equal(inputs.resolution,'2K');
+ for(const field of ['image','image[]']){
+  const repeated=decode([file(field,'b'),file(field,'a')]);
+  assert.deepEqual(repeated.references.map(ref=>ref.url.__fileRef),['request_file:b','request_file:a']);
+ }
+ for(const names of [['image[0]','image[0]'],['image[0]','image[]'],['image','image[]']])
+  assert.throws(()=>decode(names.map((name,i)=>file(name,i))));
+});
+
+test('image HTTP bridge confirms one quoted batch, returns verified images and handles original failures',async t=>{
+ const model='seedream_4.7',plugin=await load({models:[model]});
+ const dir=await mkdtemp(join(tmpdir(),'dreamina-image-')); t.after(()=>rm(dir,{recursive:true,force:true}));
+ const cfg=validateConfig({cli:process.execPath,dataDir:dir,userId:'123',space:'personal',unlimitedCredits:true,
+  token:'local-image-token-for-simulation-only',projectId:'11111111-1111-4111-8111-111111111111',
+  publicUrl:'http://localhost',maxConcurrent:8,models:{[model]:{kind:'image',model,maxCredits:0}}});
+ cfg.pollIntervalMs=0;
+ const bytes=Buffer.from('89504e470d0a1a0a00000000','hex'), subject={kind:'personal',userId:'123'};
+ const flag=(args,key)=>args.find(a=>a.startsWith('--'+key+'='))?.slice(key.length+3);
+ let nodeId,runs=0,failed=false,terminal=false,uploaded;
+ const bridge=await Bridge.open(cfg,async args=>{
+  switch(args.slice(0,2).join(' ')){
+   case 'space current':return subject;
+   case 'model list':
+    assert.ok(args.includes('--type=image'));
+    return {items:[{model,modes:[{name:'i2i',flags:[
+     {flag:'--ratio',values:['1:1']},{flag:'--resolution',values:['4K']},{flag:'--count',min:1,max:8},{flag:'--prompt',maxLength:500}],
+     references:{min:1,max:6,types:[{mediaType:'image',min:1,max:6}]}}]}]};
+   case 'resource upload':
+    uploaded=flag(args,'resource-id');return {resourceId:uploaded,mediaType:'image'};
+   case 'node create':
+    nodeId=flag(args,'node-id'); assert.equal(args[2],'image');assert.equal(flag(args,'duration'),undefined);
+    assert.equal(flag(args,'ref'),'res:'+uploaded);assert.equal(flag(args,'mode'),'i2i');assert.ok(!args.includes('--run'));
+    return {node:{nodeId},mutation:{savedDraftVersion:1}};
+   case 'node quote':return {items:[{nodeId,maxCredits:24}],totalMaxCredits:24,draftVersion:1,consumptionSubject:subject};
+   case 'node confirm':assert.equal(flag(args,'credit-ceiling'),'24');return {creditConfirmationToken:'local',creditCeiling:24,consumptionSubject:subject};
+   case 'node run':runs++;return {items:[{nodeId,submitId:flag(args,'submit-id'),state:'accepted',resources:[]}]};
+   case 'operation status':
+    return {operationRef:args[2],state:terminal?(failed?'failed':'succeeded'):'running',resources:terminal?
+     Array.from({length:4},(_,i)=>({resourceId:'image-'+i,state:!failed && i<3?'succeeded':'failed'})):[]};
+   case 'resource download':{
+    const path=flag(args,'output');await writeFile(path,bytes);
+    return {resourceId:args[2],path,size:bytes.length,sha256:createHash('sha256').update(bytes).digest('hex')};
+   }
+   default:throw Error('Unexpected simulated command: '+args.slice(0,2).join(' '));
+  }
+ });
+ t.after(()=>bridge.close());await bridge.preflight();
+ const server=createServer(bridge);await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+ t.after(()=>new Promise(resolve=>{server.closeAllConnections();server.close(resolve);}));
+ cfg.publicUrl='http://127.0.0.1:'+server.address().port;
+ for(const fail of [false,true]){
+  failed=fail;terminal=false;
+  const intent=plugin.protocols.openai_image.decodeRequest({model,operation:'edit',body:{kind:'json',value:{
+   prompt:'paper boat',n:4,resolution:'4K',image:'data:image/png;base64,'+bytes.toString('base64')}}});
+  const c={...intent,apiKey:cfg.token,baseUrl:cfg.publicUrl,publicTaskId:'task_image_'+String(fail)};
+  assert.deepEqual(plugin.extractUsage(c),{credits:8,resolution:'4k'});
+  const req=plugin.buildSubmitRequest(c);
+  const post=()=>fetch(req.url,{method:req.method,headers:req.headers,body:JSON.stringify(req.body)});
+  const resp=await post();assert.equal(resp.status,202);
+  const admitted=plugin.parseSubmitResponse(c,{body:await resp.json(),headers:Object.fromEntries(resp.headers)});
+  assert.equal((await (await post()).json()).id,admitted.taskId);
+  const poll={...c,taskId:admitted.taskId,state:admitted.state};
+  await bridge.observe(admitted.taskId);await bridge.tick();
+  assert.equal(bridge.get(admitted.taskId).billing.credits,24);
+  terminal=true;await bridge.tick();await bridge.tick();
+  const q=plugin.buildQueryRequest(poll), reply=await fetch(q.url,{headers:q.headers}),body=await reply.json();
+  const result=plugin.parseTaskResult(poll,body,{status:reply.status,headers:Object.fromEntries(reply.headers)});
+  assert.equal(result.status,fail?'FAILURE':'SUCCESS',JSON.stringify({result,body}));
+  assert.deepEqual(plugin.extractUsageOnComplete(poll,result,body),fail?{}:{credits:18,resolution:'4k'});
+  if(!fail){
+   const task={status:result.status,data:body},rendered=plugin.protocols.openai_image.render({},task);
+   assert.equal(rendered.data.length,3);assert.equal(plugin.listArtifacts(task).length,3);
+   const download=await fetch(rendered.data[2].url);assert.equal(download.headers.get('content-type'),'image/png');
+   assert.deepEqual(Buffer.from(await download.arrayBuffer()),bytes);
+   assert.equal(plugin.parseTaskResult(poll,{...body,data:[]},{status:200,headers:Object.fromEntries(reply.headers)}).status,'UNKNOWN');
+  }
+ }
+ assert.equal(runs,2);
+});

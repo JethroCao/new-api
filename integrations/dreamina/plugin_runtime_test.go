@@ -464,3 +464,41 @@ func TestStandardCreditPricingAllTiers(t *testing.T) {
 		}
 	})
 }
+
+func TestImagePluginStockHost(t *testing.T) {
+	source, err := os.ReadFile("dist/dreamina-cli.js")
+	require.NoError(t, err)
+	plugin, err := runtime.CompilePlugin(string(source), runtime.Options{})
+	require.NoError(t, err)
+	ctx := map[string]any{"operation": "generate", "model": "seedream_5.5", "body": map[string]any{
+		"kind": "json", "value": map[string]any{"prompt": "paper boat", "n": 2, "size": "2048x2048", "stream": false},
+	}}
+	intent, err := plugin.Engine.CallPath(t.Context(), "protocols", []string{"openai_image", "decodeRequest"}, ctx)
+	require.NoError(t, err)
+	driver := intent.(map[string]any)
+	driver["publicTaskId"], driver["baseUrl"], driver["apiKey"] = "task_image_test", "http://localhost", "local-test"
+	facts, err := plugin.Engine.Call(t.Context(), "extractUsage", driver)
+	require.NoError(t, err)
+	raw, err := common.Marshal(facts)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"credits":12,"resolution":"2k"}`, string(raw))
+	receipt := map[string]any{"object": "image", "model": "seedream_5.5", "status": "queued", "id": "job-image", "n": 2, "resolution": "2K", "mode": "t2i", "ratio": "1:1", "image_count": 0,
+		"billing_mode": "credits", "billing": map[string]any{"version": 2, "request_id": "task_image_test", "reserved_credits": 12}}
+	admitted, err := plugin.Engine.Call(t.Context(), "parseSubmitResponse", driver, map[string]any{"body": receipt})
+	require.NoError(t, err)
+	state, err := common.Marshal(admitted.(map[string]any)["state"])
+	require.NoError(t, err)
+	task := &model.Task{TaskID: "task_image_test", Properties: model.Properties{OriginModelName: "seedream_5.5", UpstreamModelName: "seedream_5.5"}, PrivateData: model.TaskPrivateData{UpstreamTaskID: "job-image", PluginState: state}}
+	host := adaptor.New(plugin)
+	host.Init(&relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: "http://localhost", ApiKey: "local-test"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}})
+	receipt["status"], receipt["terminal_proof"], receipt["delivery_verified"], receipt["image_count"] = "completed", true, true, 1
+	receipt["data"] = []any{map[string]any{"url": "https://example.org/photo.png"}}
+	bill := receipt["billing"].(map[string]any)
+	bill["quote_status"], bill["quoted_credits"], bill["credits"], bill["basis"] = "accepted", 14, 14, "accepted_quote"
+	raw, err = common.Marshal(receipt)
+	require.NoError(t, err)
+	result, err := host.ParseTaskResult(task, &http.Response{StatusCode: 200, Header: make(http.Header)}, raw)
+	require.NoError(t, err)
+	require.Equal(t, "SUCCESS", result.Status, result.Reason)
+	assert.EqualValues(t, 7, result.UsageFacts["credits"])
+}

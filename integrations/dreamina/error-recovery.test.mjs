@@ -27,7 +27,7 @@ async function setup(t, operation, submit, options = {}) {
     throw new Error('unexpected '+args[0]);
   });
   const bridge=await Bridge.open(cfg,cli);t.after(()=>bridge.close());
-  if(options.request)await bridge.refreshVideoCatalog();
+  if(options.request)await bridge.refreshCatalog('video');
   const job=await bridge.submit({kind:'video',model:'dreamina-video',prompt:'waves',seconds:5,...options.request},'job',false,options.billing);
   await bridge.tick();
   return {bridge,job,cfg,cli,runs:()=>runs};

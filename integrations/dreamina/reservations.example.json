@@ -2,6 +2,18 @@
   "models": [
     "seedance_2.5", "seedance_2.5_flash", "seedance_2.5_draft", "seedance_2.0_vip",
     "seedance_2.0_fast_vip", "seedance_2.0_mini", "seedance_pro_fast",
-    "happyhorse_1.1", "wan_3.0"
+    "happyhorse_1.1", "wan_3.0",
+    "high_aes_general_v50_flash",
+    "jimeng_smart_image_v1",
+    "jm_image_model_anycook",
+    "jm_image_model_yc_mj82",
+    "seedream_4.0",
+    "seedream_4.1",
+    "seedream_4.5",
+    "seedream_4.6",
+    "seedream_4.7",
+    "seedream_5.0_lite",
+    "seedream_5.0_pro",
+    "seedream_5.5"
   ]
 }

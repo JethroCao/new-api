@@ -5,7 +5,7 @@ const uuid=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const mediaName=/^([0-9a-f-]{36})-(?:input-\d+\.[a-z0-9]{1,8}|\d+\.bin(?:\.part)?)$/;
 const timestamp=n=>Number.isSafeInteger(n)&&n>0?n:undefined;
 export function mediaDeadlines(job){
- if(job?.request?.kind!=='video'||!['completed','failed'].includes(job.status))return {};
+ if((job?.request?.kind!=='video' && !(job?.request?.kind==='image' && job.billingMode==='credits'))||!['completed','failed'].includes(job.status))return {};
  const completed=timestamp(job.completed_at),downloaded=timestamp(job.timings?.download_completed_at_ms);
  const delivered=downloaded?Math.floor(downloaded/1000):completed;
  const end=completed||(job.status==='completed'?delivered:undefined);
@@ -28,7 +28,7 @@ export async function cleanupMedia({dataDir,loadJobs,isBusy=()=>false,now=Date.n
    for(const name of groups.get(id)){
     const input=(job.inputs||[]).some(f=>f.filename===name);
     const output=(job.files||[]).some(f=>f.filename===name);
-    const partial=Array.from({length:Number.isSafeInteger(job.request?.n)&&job.request.n<=4?job.request.n:0},(_,i)=>id+'-'+i+'.bin.part').includes(name);
+    const partial=Array.from({length:Number.isSafeInteger(job.request?.n)&&job.request.n<=8?job.request.n:0},(_,i)=>id+'-'+i+'.bin.part').includes(name);
     const expires=output?(deadlines.local_content_expires_at||deadlines.content_expires_at||deadlines.input_expires_at):input||partial?deadlines.input_expires_at:undefined;
     if(!expires||now<expires*1000||isBusy(id))continue;
     try{

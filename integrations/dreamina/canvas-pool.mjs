@@ -7,7 +7,13 @@ const HASH=/^[0-9a-f]{64}$/;
 const LIMIT=5;
 function fail(message,status=503) {throw Object.assign(new Error(message),{status});}
 const used=c=>c.slots.reduce((n,s)=>n+s.units,0);
-const units=job=>job.request?.n ?? 1;
+// A batch occupies up to one complete canvas. A 6–8 image batch is
+// indivisible and gets an empty canvas of its own.
+function units(job) {
+  const count=job.request?.n ?? 1;
+  if (!Number.isSafeInteger(count) || count<1 || count>8) fail('invalid canvas batch count');
+  return Math.min(count,LIMIT);
+}
 const summary=c=>({projectId:c.projectId,name:c.name});
 const canvasName=(day,sequence,channel='')=>`Nexora-${channel ? channel+'-' : ''}${day}-${String(sequence).padStart(3,'0')}`;
 
@@ -37,7 +43,7 @@ export class CanvasPool {
         !/^\d{8}$/.test(c.day) || !Number.isSafeInteger(c.sequence) || c.sequence<1 || (used(c)>LIMIT && !c.grandfathered) ||
         !['','A','B'].includes(c.channel ?? '') || c.name!==canvasName(c.day,c.sequence,c.channel ?? ''))fail('invalid canvas registry allocation');
       for(const slot of c.slots) {
-        if(!Number.isSafeInteger(slot.units) || slot.units<1 || slot.units>4 || !HASH.test(slot.key) || !HASH.test(slot.digest) || keys.has(slot.key))fail('invalid canvas registry slot');
+        if(!Number.isSafeInteger(slot.units) || slot.units<1 || slot.units>LIMIT || !HASH.test(slot.key) || !HASH.test(slot.digest) || keys.has(slot.key))fail('invalid canvas registry slot');
         keys.add(slot.key);
       }
       projects.set(c.projectId,c);
@@ -84,7 +90,7 @@ export class CanvasPool {
   reserve(job,preferredProjectId) {
     const {key,digest}=job,count=units(job);
     return this.transaction(async state=>{
-      if(!Number.isSafeInteger(count) || count<1 || count>4 || !HASH.test(key) || !HASH.test(digest))fail('invalid canvas reservation');
+      if(!Number.isSafeInteger(count) || count<1 || count>LIMIT || !HASH.test(key) || !HASH.test(digest))fail('invalid canvas reservation');
       for(const c of state.canvases) {
         const slot=c.slots.find(s=>s.key===key);
         if(!slot)continue;

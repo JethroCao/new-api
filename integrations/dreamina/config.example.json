@@ -59,6 +59,68 @@
       "maxCredits": 0
     }
   },
+  "additionalModels": {
+    "high_aes_general_v50_flash": {
+      "kind": "image",
+      "model": "high_aes_general_v50_flash",
+      "maxCredits": 0
+    },
+    "jimeng_smart_image_v1": {
+      "kind": "image",
+      "model": "jimeng_smart_image_v1",
+      "maxCredits": 0
+    },
+    "jm_image_model_anycook": {
+      "kind": "image",
+      "model": "jm_image_model_anycook",
+      "maxCredits": 0
+    },
+    "jm_image_model_yc_mj82": {
+      "kind": "image",
+      "model": "jm_image_model_yc_mj82",
+      "maxCredits": 0
+    },
+    "seedream_4.0": {
+      "kind": "image",
+      "model": "seedream_4.0",
+      "maxCredits": 0
+    },
+    "seedream_4.1": {
+      "kind": "image",
+      "model": "seedream_4.1",
+      "maxCredits": 0
+    },
+    "seedream_4.5": {
+      "kind": "image",
+      "model": "seedream_4.5",
+      "maxCredits": 0
+    },
+    "seedream_4.6": {
+      "kind": "image",
+      "model": "seedream_4.6",
+      "maxCredits": 0
+    },
+    "seedream_4.7": {
+      "kind": "image",
+      "model": "seedream_4.7",
+      "maxCredits": 0
+    },
+    "seedream_5.0_lite": {
+      "kind": "image",
+      "model": "seedream_5.0_lite",
+      "maxCredits": 0
+    },
+    "seedream_5.0_pro": {
+      "kind": "image",
+      "model": "seedream_5.0_pro",
+      "maxCredits": 0
+    },
+    "seedream_5.5": {
+      "kind": "image",
+      "model": "seedream_5.5",
+      "maxCredits": 0
+    }
+  },
   "maxConcurrent": 100,
   "maxAdmissions": 100,
   "maxQueueWaitSeconds": 1800,
